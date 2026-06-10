@@ -118,18 +118,40 @@ def read_base_reclassificada() -> Optional[pd.DataFrame]:
 def read_estrutura_entidades_cc() -> Optional[pd.DataFrame]:
     """
     NOVO (Tool 200) — cadastro de Entidades x Centros de Custo.
-    Retorna None se o arquivo não existir (sem cadastro → aba de CC vazia).
-    Exige .xlsx (openpyxl); .xlsb não é lido de forma confiável.
+
+    Input OPCIONAL e tolerante a falhas: qualquer problema de leitura apenas emite
+    WARNING e retorna None (a aba 'Centros de Custo' do relatório fica vazia) — nunca
+    derruba a execução, pois as demais saídas não dependem deste cadastro.
+
+    Lê via openpyxl com data_only=True (pega o valor calculado das fórmulas). Exige
+    .xlsx de verdade — .xlsb (mesmo renomeado) NÃO é suportado: o conteúdo binário
+    não abre no openpyxl e o pyxlsb lê este arquivo de forma incorreta.
     """
     cfg = INPUT_FILES["estrutura_entidades_cc"]
     path: Path = cfg["path"]
     if not path.exists():
         logger.warning(
             f"[Tool 200] cadastro de Centros de Custo não encontrado em {path}. "
-            f"A aba 'Centros de Custo' do relatório de exceções ficará vazia."
+            f"A aba 'Centros de Custo' do relatório ficará vazia."
         )
         return None
-    df = pd.read_excel(path, sheet_name=cfg["sheet"])
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True)
+        sheet = cfg["sheet"] if cfg["sheet"] in wb.sheetnames else wb.sheetnames[0]
+        rows = list(wb[sheet].values)
+        wb.close()
+        if not rows:
+            logger.warning("[Tool 200] cadastro de CC vazio. Aba 'Centros de Custo' ficará vazia.")
+            return None
+        header = [str(h) if h is not None else f"col{i}" for i, h in enumerate(rows[0])]
+        df = pd.DataFrame(rows[1:], columns=header)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"[Tool 200] não foi possível ler o cadastro de CC ({exc}). "
+            f"Envie em .xlsx (não .xlsb). A aba 'Centros de Custo' ficará vazia."
+        )
+        return None
     log_step(logger, "200", "Read Estrutura de Entidades x CC", df)
     return df
 
