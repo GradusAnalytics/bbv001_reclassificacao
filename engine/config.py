@@ -36,7 +36,23 @@ INPUT_FILES = {
         "path": INPUT_DIR / "base_reclassificada_a2f37.xlsx",
         "sheet": "Sheet1",
     },
+    "estrutura_entidades_cc": {             # NOVO — cadastro de Centros de Custo (Tool 200)
+        # Cadastro de Entidades x Centros de Custo. Enviar em .xlsx (pyxlsb não lê
+        # este arquivo de forma confiável). Opcional: sem ele, a aba de CC sai vazia.
+        "path": INPUT_DIR / "estrutura_entidades_cc.xlsx",
+        "sheet": "Estrutura completa de Entidades",
+    },
 }
+
+# --- Cadastros para o relatório de exceções (Tool 200) -------------------
+# Centro de custo: coluna do código no cadastro de Entidades x CC
+CC_CADASTRO_CODE_COL = "Cód. centro de custo"
+# Base de fechamento: colunas de código e descrição do CC
+BASE_CC_CODE_COL = "Centro de Custo"
+BASE_CC_DESC_COL = "Nome do Centro de Custo"
+# Base de fechamento: colunas de código e descrição da conta contábil
+BASE_CONTA_CODE_COL = "Conta Contabil"
+BASE_CONTA_DESC_COL = "Nome da Conta"
 
 # --- Outputs --------------------------------------------------------------
 OUTPUT_RECLASSIFIER = OUTPUT_DIR / "BBV001-Base_para_reclassificador.xlsx"   # Tool 123

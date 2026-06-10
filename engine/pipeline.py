@@ -35,11 +35,12 @@ def run_pipeline() -> dict:
     df_estrutura  = io.read_estrutura_contas()       # Tool 61
     df_manual     = io.get_manual_overrides()        # Tool 86
     df_reclass    = io.read_base_reclassificada()    # Tool 124 (optional)
+    df_cc_cad     = io.read_estrutura_entidades_cc() # Tool 200 (cadastro de CC, opcional)
 
     # -------------------------------------------------------------------
     # STAGE 1 — PREPROCESS
     # -------------------------------------------------------------------
-    df_enriched = t.preprocess_base(df_base, df_estrutura)
+    df_enriched, dropped_contas = t.preprocess_base(df_base, df_estrutura)
 
     # -------------------------------------------------------------------
     # STAGE 2 — COBRANÇA SPLIT
@@ -105,6 +106,11 @@ def run_pipeline() -> dict:
     final_consolidated = t.build_final_consolidated(unioned)
 
     # -------------------------------------------------------------------
+    # NOVO — RELATÓRIO DE EXCEÇÕES (Tool 200/201)
+    # -------------------------------------------------------------------
+    exceptions = t.build_exceptions(dropped_contas, df_base, df_cc_cad)
+
+    # -------------------------------------------------------------------
     # WRITE OUTPUTS
     # -------------------------------------------------------------------
     path_reclass = io.write_reclassifier_base(reclassifier_base)
@@ -121,6 +127,7 @@ def run_pipeline() -> dict:
         "final_consolidated": final_consolidated,
         "path_reclass": path_reclass,
         "path_final": path_final,
+        "exceptions": exceptions,   # {"contas": df, "centros_custo": df}
         # Intermediates for debugging
         "_intermediates": {
             "enriched": df_enriched,

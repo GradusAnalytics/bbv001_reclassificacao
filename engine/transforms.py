@@ -41,12 +41,13 @@ logger = logging.getLogger(__name__)
 # =========================================================================
 # STAGE 1 — PREPROCESS
 # =========================================================================
-def preprocess_base(df_base: pd.DataFrame, df_estrutura: pd.DataFrame) -> pd.DataFrame:
+def preprocess_base(df_base: pd.DataFrame, df_estrutura: pd.DataFrame):
     """
     Tools 63 (filter excluded CVs) + 62 (join with Estrutura de Contas).
 
-    Output: base enriched with Conta GCUT and Pacote GCUT,
-    ready to be split on 'Cobrança' (Tool 5).
+    Retorna (j_out, l_out):
+      j_out — base enriquecida (Conta GCUT / Pacote GCUT), segue para a cascata.
+      l_out — contas da base SEM match na Estrutura (descartadas) → relatório de exceções.
     """
     # Tool 63 — filter excluded value classes
     mask = ~df_base["Nome da Classe de Valor"].isin(EXCLUDED_VALUE_CLASSES)
@@ -81,7 +82,9 @@ def preprocess_base(df_base: pd.DataFrame, df_estrutura: pd.DataFrame) -> pd.Dat
     ]
     j_out = j_out.drop(columns=[c for c in estrutura_drop if c in j_out.columns])
     log_step(logger, "62", "Join Base × Estrutura (matched)", j_out)
-    return j_out
+    # j_out segue para a cascata EXATAMENTE como antes (paridade preservada);
+    # l_out (contas sem match) vai só para o relatório de exceções.
+    return j_out, l_out
 
 
 # =========================================================================
@@ -622,3 +625,63 @@ def build_final_consolidated(df_unioned: pd.DataFrame) -> pd.DataFrame:
     df_out = df[keep].copy()
     log_step(logger, "114", "Final consolidated schema", df_out)
     return df_out
+
+
+# =========================================================================
+# NOVO — RELATÓRIO DE EXCEÇÕES (Tool 200/201) — não existe no Alteryx
+# =========================================================================
+def build_exceptions(dropped_contas, df_base_raw, df_cc_cadastro):
+    """
+    Monta os dois DataFrames de exceções (Código · Descrição · Valor), somados por código:
+
+      - Contas Contábeis (Tool 200): contas da base SEM match na Estrutura de Contas
+        (o L do Tool 62 — exatamente as linhas hoje descartadas).
+      - Centros de Custo (Tool 201): CCs presentes na base de fechamento (realizado) que
+        NÃO existem no cadastro de Entidades x CC.
+
+    A descrição vem da base do realizado: os itens, por definição, não estão no cadastro,
+    então o cadastro não tem descrição para eles. O fluxo principal NÃO é alterado.
+    """
+    from config import (
+        CC_CADASTRO_CODE_COL, BASE_CC_CODE_COL, BASE_CC_DESC_COL,
+        BASE_CONTA_CODE_COL, BASE_CONTA_DESC_COL,
+    )
+    cols = ["Código", "Descrição", "Valor"]
+
+    # --- Tool 200: Contas Contábeis não cadastradas ---
+    if (dropped_contas is not None and len(dropped_contas) > 0
+            and BASE_CONTA_CODE_COL in dropped_contas.columns):
+        g = (dropped_contas.groupby(BASE_CONTA_CODE_COL, dropna=False)
+                          .agg(Descrição=(BASE_CONTA_DESC_COL, "first"),
+                               Valor=("Valor", "sum"))
+                          .reset_index()
+                          .rename(columns={BASE_CONTA_CODE_COL: "Código"}))
+        contas = g[cols].sort_values("Valor", ascending=False).reset_index(drop=True)
+    else:
+        contas = pd.DataFrame(columns=cols)
+    log_step(logger, "200", "Exceções — Contas Contábeis não cadastradas", contas)
+
+    # --- Tool 201: Centros de Custo não cadastrados ---
+    if (df_cc_cadastro is not None and CC_CADASTRO_CODE_COL in df_cc_cadastro.columns
+            and BASE_CC_CODE_COL in df_base_raw.columns):
+        cadastro = set(
+            pd.to_numeric(df_cc_cadastro[CC_CADASTRO_CODE_COL], errors="coerce")
+              .dropna().astype("int64")
+        )
+        base_cc = df_base_raw[[BASE_CC_CODE_COL, BASE_CC_DESC_COL, "Valor"]].copy()
+        code_num = pd.to_numeric(base_cc[BASE_CC_CODE_COL], errors="coerce").astype("Int64")
+        nao_encontrados = base_cc[~code_num.isin(cadastro)]
+        if len(nao_encontrados) > 0:
+            g = (nao_encontrados.groupby(BASE_CC_CODE_COL, dropna=False)
+                               .agg(Descrição=(BASE_CC_DESC_COL, "first"),
+                                    Valor=("Valor", "sum"))
+                               .reset_index()
+                               .rename(columns={BASE_CC_CODE_COL: "Código"}))
+            centros = g[cols].sort_values("Valor", ascending=False).reset_index(drop=True)
+        else:
+            centros = pd.DataFrame(columns=cols)
+    else:
+        centros = pd.DataFrame(columns=cols)
+    log_step(logger, "201", "Exceções — Centros de Custo não cadastrados", centros)
+
+    return {"contas": contas, "centros_custo": centros}

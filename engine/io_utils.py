@@ -115,6 +115,25 @@ def read_base_reclassificada() -> Optional[pd.DataFrame]:
     return df
 
 
+def read_estrutura_entidades_cc() -> Optional[pd.DataFrame]:
+    """
+    NOVO (Tool 200) — cadastro de Entidades x Centros de Custo.
+    Retorna None se o arquivo não existir (sem cadastro → aba de CC vazia).
+    Exige .xlsx (openpyxl); .xlsb não é lido de forma confiável.
+    """
+    cfg = INPUT_FILES["estrutura_entidades_cc"]
+    path: Path = cfg["path"]
+    if not path.exists():
+        logger.warning(
+            f"[Tool 200] cadastro de Centros de Custo não encontrado em {path}. "
+            f"A aba 'Centros de Custo' do relatório de exceções ficará vazia."
+        )
+        return None
+    df = pd.read_excel(path, sheet_name=cfg["sheet"])
+    log_step(logger, "200", "Read Estrutura de Entidades x CC", df)
+    return df
+
+
 def get_manual_overrides() -> pd.DataFrame:
     """Tool 86 — hardcoded TextInput, 11 rows."""
     df = pd.DataFrame(MANUAL_GROUP_OVERRIDES)

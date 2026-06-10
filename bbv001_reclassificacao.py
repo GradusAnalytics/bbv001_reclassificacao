@@ -28,14 +28,16 @@ CANON = {
     "base_fechamento":      "base_fechamento.xlsx",
     "depara_custo":         "DeXPara_Custo_Gradus.xlsx",
     "classe_valor_conta":   "BBV001-260509-Classe de Valor x Conta Contábil-v1 MU.xlsx",
-    "estrutura_contas":     "20260509 - 12h30 - Estrutura de contas.xlsx",
-    "base_reclassificada":  "base_reclassificada_a2f37.xlsx",
+    "estrutura_contas":      "20260509 - 12h30 - Estrutura de contas.xlsx",
+    "base_reclassificada":   "base_reclassificada_a2f37.xlsx",
+    "estrutura_entidades_cc": "estrutura_entidades_cc.xlsx",
 }
 WORK = "/tmp/bbv001"
 IN_DIR = os.path.join(WORK, "inputs")
 OUT_DIR = os.path.join(WORK, "outputs")
 FINAL_NAME = "BBV001-Base_consolidada_final.xlsx"
 RECL_NAME = "BBV001-Base_para_reclassificador.xlsx"
+EXCECOES_NAME = "BBV001-Excecoes_nao_cadastrados.xlsx"
 
 
 def _write_input(file_obj, dest):
@@ -70,18 +72,19 @@ def _read_bytesio(name):
 
 
 def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
-         estrutura_contas=None, base_reclassificada=None):
+         estrutura_contas=None, base_reclassificada=None, estrutura_entidades_cc=None):
     # 1) Diretórios limpos por execução
     shutil.rmtree(WORK, ignore_errors=True)
     os.makedirs(IN_DIR, exist_ok=True)
     os.makedirs(OUT_DIR, exist_ok=True)
 
     incoming = {
-        "base_fechamento":     base_fechamento,
-        "depara_custo":        depara_custo,
-        "classe_valor_conta":  classe_valor_conta,
-        "estrutura_contas":    estrutura_contas,
-        "base_reclassificada": base_reclassificada,
+        "base_fechamento":      base_fechamento,
+        "depara_custo":         depara_custo,
+        "classe_valor_conta":   classe_valor_conta,
+        "estrutura_contas":     estrutura_contas,
+        "base_reclassificada":  base_reclassificada,
+        "estrutura_entidades_cc": estrutura_entidades_cc,
     }
     has_reclass = False
     for role, fobj in incoming.items():
@@ -134,5 +137,23 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
     if recl_io is not None:
         parametros_saida["base_reclassificador"] = recl_io
         parametros_saida["base_reclassificador__nome"] = RECL_NAME
+
+    # 6) Excel de exceções (2 abas): Contas Contábeis e Centros de Custo
+    import pandas as pd
+    cols = ["Código", "Descrição", "Valor"]
+    exc = result.get("exceptions", {}) or {}
+    df_contas = exc.get("contas")
+    df_cc = exc.get("centros_custo")
+    if df_contas is None:
+        df_contas = pd.DataFrame(columns=cols)
+    if df_cc is None:
+        df_cc = pd.DataFrame(columns=cols)
+    exc_io = io.BytesIO()
+    with pd.ExcelWriter(exc_io, engine="openpyxl") as xw:
+        df_contas.to_excel(xw, sheet_name="Contas Contábeis", index=False)
+        df_cc.to_excel(xw, sheet_name="Centros de Custo", index=False)
+    exc_io.seek(0)
+    parametros_saida["excecoes"] = exc_io
+    parametros_saida["excecoes__nome"] = EXCECOES_NAME
 
     return parametros_saida
