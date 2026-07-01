@@ -14,7 +14,16 @@
                 }
             ],
             "essential": true,
-            "environment": [],
+            "environment": [
+                {
+                    "name": "PPR_API_BASE_URL",
+                    "value": "https://ppr.gradusanalytics.com.br"
+                },
+                {
+                    "name": "PPR_API_TOKEN",
+                    "value": "65336ea7-7507-46d0-942e-36f7849b336c"
+                }
+            ],
             "environmentFiles": [],
             "mountPoints": [],
             "volumesFrom": [],

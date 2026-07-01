@@ -9,14 +9,24 @@ import logging
 import pandas as pd
 
 import io_utils as io
+import reclassifier_bridge
 import transforms as t
 
 logger = logging.getLogger(__name__)
 
 
-def run_pipeline() -> dict:
+def run_pipeline(
+    parametros_reclassificador=None,
+    modelo_reclassificador=None,
+    base_reclassificada_override=None,
+) -> dict:
     """
     Execute the full pipeline.
+
+    parametros_reclassificador / modelo_reclassificador: arquivos (file-like) usados
+    pela ponte reclassifier_bridge para chamar reclassificador_predicao via API do
+    PPR. base_reclassificada_override: se informado, pula a chamada à API e usa esse
+    DataFrame diretamente — mantém o fluxo manual antigo como plano B.
 
     Returns a dict of intermediate DataFrames for inspection/testing,
     plus paths to the two output files.
@@ -34,7 +44,6 @@ def run_pipeline() -> dict:
     df_unico_cv   = io.read_unico_cv()               # Tool 48
     df_estrutura  = io.read_estrutura_contas()       # Tool 61
     df_manual     = io.get_manual_overrides()        # Tool 86
-    df_reclass    = io.read_base_reclassificada()    # Tool 124 (optional)
     df_cc_cad     = io.read_estrutura_entidades_cc() # Tool 200 (cadastro de CC, opcional)
 
     # -------------------------------------------------------------------
@@ -90,6 +99,16 @@ def run_pipeline() -> dict:
     # -------------------------------------------------------------------
     for_reclass          = t.union_for_reclassificador(unm_56, to_reclass_t117)
     reclassifier_base    = t.build_reclassifier_base(for_reclass)
+
+    if base_reclassificada_override is not None:
+        logger.info("[Bridge] Usando base_reclassificada informada manualmente (pulando chamada à API).")
+        df_reclass = base_reclassificada_override
+    else:
+        logger.info("[Bridge] Chamando reclassificador_predicao via API do PPR...")
+        df_reclass = reclassifier_bridge.run_predicao_via_api(
+            reclassifier_base, parametros_reclassificador, modelo_reclassificador,
+        )
+
     reclassificador_final = t.integrate_reclassified(for_reclass, df_reclass)
 
     # -------------------------------------------------------------------

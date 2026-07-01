@@ -5,9 +5,13 @@ um repositório que o GitHub Actions builda numa imagem ECR e implanta como task
 **ECS Fargate**. O PPR aciona via `tipo_execucao=ecs` → POST em `/dev/generic_tool`
 com `toolname=code`; o `gradus-platform` (`ecs_handler`) baixa os inputs do S3 já
 abertos, chama `main()`, sobe os outputs e faz o callback. **Não escrevemos S3 nem
-callback** — só o `main()`.
+callback diretamente** — a única exceção é `engine/reclassifier_bridge.py`, que usa
+as mesmas credenciais AWS já disponíveis no ambiente do processo para subir arquivos
+de scratch e chamar a API pública do PPR (ver seção "Reclassificação via API" abaixo).
 
-O engine BBV001 fica em `engine/` e **não é alterado** (paridade com o Alteryx).
+O engine BBV001 fica em `engine/` e **não é alterado** na sua lógica de negócio
+original (paridade com o Alteryx) — a única adição é a etapa de reclassificação via
+API descrita abaixo, que substitui o processo manual de Run 1/Run 2.
 
 ## Conteúdo do repositório
 
@@ -48,8 +52,10 @@ nomes usados no `main()` e no dict de saída.
 | `depara_custo` | De-Para Custo | Obrigatório |
 | `classe_valor_conta` | Classe de Valor × Conta Contábil | Obrigatório |
 | `estrutura_contas` | Estrutura de Contas | Obrigatório |
-| `base_reclassificada` | Base Reclassificada (Run 2) | **Opcional** |
+| `base_reclassificada` | Base Reclassificada — **override manual** (pula a chamada à API abaixo) | **Opcional** |
 | `estrutura_entidades_cc` | Estrutura de Entidades e Centros de Custo | **Opcional** |
+| `parametros_reclassificador` | Parâmetros do Reclassificador (4 abas: Param_Reclassificador, Param_Interdições, Estrutura_Contas, Escopo_Pacotes) | **Opcional**, com `default_file` = `BBV001-Parametros Predicao.xlsx` |
+| `modelo_reclassificador` | Modelo treinado do reclassificador (`.pkl`) | **Opcional**, com `default_file` = o `.pkl` atual (`reclassifier_BBV001_...`) |
 
 > O nome do arquivo enviado não importa — o `main()` renomeia para o nome
 > canônico que o engine espera. As **abas** dos Excel precisam ser as padrão
@@ -86,6 +92,45 @@ nomes usados no `main()` e no dict de saída.
 (O `main()` ainda devolve `run_mode` = "1"/"2"; opcionalmente crie um OutputField
 `run_mode` tipo Texto curto se quiser exibi-lo.)
 
+## Reclassificação via API (substitui o Run 1 / Run 2 manual)
+
+A etapa de "Reclassificador" (Tools 121-134 do Alteryx original) hoje chama, dentro da
+própria execução do BBV001, a ferramenta `reclassificador_predicao` já publicada em
+produção no PPR (`engine/reclassifier_bridge.py`):
+
+1. Traduz a `base_reclassificador` (schema `RECLASSIFIER_OUTPUT_SCHEMA`) renomeando
+   3 colunas (`Codigo Interno`→`Chave única`, `Conta Contabil`→`Cód Conta Contábil`,
+   `Centro de Custo`→`Código Centro de Custo`) para o formato esperado pela `Base` do
+   `reclassificador_predicao`.
+2. Sobe essa base traduzida + os inputs `parametros_reclassificador` e
+   `modelo_reclassificador` para chaves de scratch em
+   `s3://bucket-ppr/tools/reclassificador_predicao/_bridge/<uuid>/...`.
+3. Dispara `POST {PPR_API_BASE_URL}/ferramentas/api/exec/` com
+   `ferramenta=reclassificador_predicao`, espera por polling em
+   `GET .../api/exec/<execution_id>/` e baixa o output `output`
+   (`base_reclassificada.xlsx`).
+4. Segue o pipeline normalmente (`transforms.integrate_reclassified`), que só exige
+   as colunas `Chave única` e `Conta ajustada` desse arquivo — presentes sem
+   necessidade de tradução no sentido de volta.
+
+Se o input `base_reclassificada` for informado manualmente, essa chamada é **pulada**
+e o arquivo fornecido é usado diretamente (comportamento equivalente ao antigo Run 2).
+
+### Pré-requisitos operacionais
+- Variáveis de ambiente na task ECS (`task-definition.json` →
+  `containerDefinitions[0].environment`):
+  - `PPR_API_BASE_URL` (ex.: `https://ppr.gradusanalytics.com.br`)
+  - `PPR_API_TOKEN` — token de um usuário do PPR (`tokens.UserToken`) com permissão
+    para a ferramenta `reclassificador_predicao` e `time_credits` suficientes (ou
+    `is_staff=True`). Por ora reaproveita um token de staff existente; migrar para um
+    usuário de serviço dedicado + AWS Secrets Manager é a hardening recomendada.
+- `aws_access_key_id`/`aws_secret_access_key` — já chegam ao ambiente do processo via
+  o dispatcher `generic_tool` do PPR (mesmas variáveis que o `ecs_handler.py` legado
+  de `reclassificador_predicao`/`reclassificador_metricas` usa para ler/escrever S3).
+- Cadastrar `parametros_reclassificador`/`modelo_reclassificador` como InputFields
+  opcionais da `Ferramenta` no PPR, com `default_file` apontando para
+  `BBV001-Parametros Predicao.xlsx` e o `.pkl` atual (ver tabela de InputFields acima).
+
 ## Deploy
 
 1. Crie o repositório **`bbv001_reclassificacao`** na org `GradusAnalytics`
@@ -99,8 +144,13 @@ nomes usados no `main()` e no dict de saída.
    - publica o pacote no S3 `bucket-gradus-packages`.
 4. Confirme que o dispatcher `generic_tool` reconhece o `toolname`
    `bbv001_reclassificacao` (mesma convenção das outras ferramentas ECS de vocês).
-5. No PPR, cadastre a `Ferramenta` + Inputs/Outputs acima, libere para os usuários
-   e teste pela própria interface (upload dos 4 arquivos → executar).
+5. No PPR, cadastre a `Ferramenta` + Inputs/Outputs acima (incluindo
+   `parametros_reclassificador`/`modelo_reclassificador` com `default_file`), libere
+   para os usuários e teste pela própria interface (upload dos 4 arquivos
+   obrigatórios → executar).
+6. Configure `PPR_API_BASE_URL`/`PPR_API_TOKEN` no `task-definition.json` (ver seção
+   "Reclassificação via API") e re-registre a task definition antes do primeiro teste
+   real — sem isso a execução falha ao tentar chamar `reclassificador_predicao`.
 
 ## Validação já feita (offline)
 
@@ -115,5 +165,7 @@ reais:
   gerada.
 
 Falta confirmar em ambiente real só o que depende da infra: o contrato exato de
-arquivo aberto que o `gradus-platform` passa ao `main()` e o roteamento do
-`generic_tool` para a task ECS — ambos se confirmam no primeiro teste em dev.
+arquivo aberto que o `gradus-platform` passa ao `main()`, o roteamento do
+`generic_tool` para a task ECS, e a chamada real via API a `reclassificador_predicao`
+(`engine/reclassifier_bridge.py`) — todos se confirmam no primeiro teste em dev, com
+`PPR_API_TOKEN`/`PPR_API_BASE_URL` configurados.

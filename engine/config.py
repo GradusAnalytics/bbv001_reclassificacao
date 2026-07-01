@@ -11,6 +11,20 @@ from pathlib import Path
 INPUT_DIR = Path(os.environ.get("BBV001_INPUT_DIR", "./inputs"))
 OUTPUT_DIR = Path(os.environ.get("BBV001_OUTPUT_DIR", "./outputs"))
 
+# --- Reclassification bridge (calls reclassificador_predicao via PPR API) ------
+# aws_access_key_id/aws_secret_access_key seguem o mesmo padrão (nomes em minúsculo)
+# que o dispatcher generic_tool do PPR injeta em toda execução tipo_execucao=ecs —
+# ver ecs_handler.py legado de reclassificador_predicao/reclassificador_metricas.
+AWS_ACCESS_KEY_ID = os.environ.get("aws_access_key_id")
+AWS_SECRET_ACCESS_KEY = os.environ.get("aws_secret_access_key")
+BBV001_S3_BUCKET = os.environ.get("BBV001_S3_BUCKET", "bucket-ppr")
+
+PPR_API_BASE_URL = os.environ.get("PPR_API_BASE_URL", "https://ppr.gradusanalytics.com.br")
+PPR_API_TOKEN = os.environ.get("PPR_API_TOKEN")  # obrigatório para a etapa de reclassificação via API
+RECLASSIFICADOR_PREDICAO_TOOLNAME = "reclassificador_predicao"
+RECLASSIFIER_BRIDGE_POLL_INTERVAL_S = int(os.environ.get("RECLASSIFIER_BRIDGE_POLL_INTERVAL_S", 10))
+RECLASSIFIER_BRIDGE_TIMEOUT_S = int(os.environ.get("RECLASSIFIER_BRIDGE_TIMEOUT_S", 1800))
+
 # --- Inputs (mapped to Alteryx Tool IDs) ---------------------------------
 INPUT_FILES = {
     "base_fechamento": {                   # Tool 4

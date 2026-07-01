@@ -8,7 +8,13 @@ Contrato gradus-platform (ver dummy_repo):
     e o nome vai em "<código>__nome". O wrapper sobe os arquivos ao S3 e faz o callback.
 
 Inputs  (InputField.code): base_fechamento, depara_custo, classe_valor_conta,
-                           estrutura_contas, base_reclassificada (opcional → Run 2).
+                           estrutura_contas, estrutura_entidades_cc (opcional),
+                           parametros_reclassificador (opcional), modelo_reclassificador
+                           (opcional) — usados por engine.reclassifier_bridge para
+                           chamar reclassificador_predicao via API do PPR e integrar o
+                           resultado na mesma execução. base_reclassificada (opcional)
+                           agora é só um override manual: se informado, pula a chamada
+                           à API e usa o arquivo fornecido diretamente.
 Outputs (OutputField.code): base_final (arquivo), base_reclassificador (arquivo),
                             auditoria (tabela), log_execucao (texto_longo).
 
@@ -29,7 +35,6 @@ CANON = {
     "depara_custo":         "DeXPara_Custo_Gradus.xlsx",
     "classe_valor_conta":   "BBV001-260509-Classe de Valor x Conta Contábil-v1 MU.xlsx",
     "estrutura_contas":      "20260509 - 12h30 - Estrutura de contas.xlsx",
-    "base_reclassificada":   "base_reclassificada_a2f37.xlsx",
     "estrutura_entidades_cc": "estrutura_entidades_cc.xlsx",
 }
 WORK = "/tmp/bbv001"
@@ -72,7 +77,10 @@ def _read_bytesio(name):
 
 
 def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
-         estrutura_contas=None, base_reclassificada=None, estrutura_entidades_cc=None):
+         estrutura_contas=None, base_reclassificada=None, estrutura_entidades_cc=None,
+         parametros_reclassificador=None, modelo_reclassificador=None):
+    import pandas as pd
+
     # 1) Diretórios limpos por execução
     shutil.rmtree(WORK, ignore_errors=True)
     os.makedirs(IN_DIR, exist_ok=True)
@@ -83,14 +91,20 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
         "depara_custo":         depara_custo,
         "classe_valor_conta":   classe_valor_conta,
         "estrutura_contas":     estrutura_contas,
-        "base_reclassificada":  base_reclassificada,
         "estrutura_entidades_cc": estrutura_entidades_cc,
     }
-    has_reclass = False
     for role, fobj in incoming.items():
-        wrote = _write_input(fobj, os.path.join(IN_DIR, CANON[role]))
-        if role == "base_reclassificada" and wrote:
-            has_reclass = True
+        _write_input(fobj, os.path.join(IN_DIR, CANON[role]))
+
+    # base_reclassificada agora é só o override manual (pula a chamada à API do PPR
+    # em reclassifier_bridge quando informado) — lido direto em memória, não escrito
+    # em disco, já que pipeline.run_pipeline() espera um DataFrame.
+    df_reclass_override = None
+    if base_reclassificada is not None:
+        df_reclass_override = pd.read_excel(base_reclassificada, sheet_name="Sheet1")
+    has_reclass = df_reclass_override is not None or (
+        parametros_reclassificador is not None and modelo_reclassificador is not None
+    )
 
     # 2) Captura do log (log_step do engine)
     buf = io.StringIO()
@@ -106,7 +120,11 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
     os.environ["BBV001_BASE_FILE"] = CANON["base_fechamento"]
 
     import pipeline
-    result = pipeline.run_pipeline()
+    result = pipeline.run_pipeline(
+        parametros_reclassificador=parametros_reclassificador,
+        modelo_reclassificador=modelo_reclassificador,
+        base_reclassificada_override=df_reclass_override,
+    )
 
     # 4) Auditoria por Tipo (output tipo=tabela → JSON array de linhas)
     audit_rows = []
@@ -139,7 +157,6 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
         parametros_saida["base_reclassificador__nome"] = RECL_NAME
 
     # 6) Excel de exceções (2 abas): Contas Contábeis e Centros de Custo
-    import pandas as pd
     cols = ["Código", "Descrição", "Valor"]
     exc = result.get("exceptions", {}) or {}
     df_contas = exc.get("contas")
