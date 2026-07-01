@@ -62,9 +62,19 @@ nomes usados no `main()` e no dict de saída.
 > (Base / Planilha1 / Base+Unico CV / Estrutura de contas / Sheet1 /
 > "Estrutura completa de Entidades").
 >
-> ⚠️ O cadastro `estrutura_entidades_cc` deve ser enviado em **.xlsx** — o
-> arquivo original vem em .xlsb com fórmulas que o leitor não decodifica de
-> forma confiável. Sem esse input, a aba "Centros de Custo" do relatório sai vazia.
+> Todos os inputs de planilha (`base_fechamento`, `depara_custo`,
+> `classe_valor_conta`, `estrutura_contas`, `base_reclassificada`,
+> `estrutura_entidades_cc`) aceitam tanto **.xlsx** quanto **.xlsb** —
+> `engine/io_utils.py` detecta o formato real pelos magic bytes do arquivo (a
+> extensão não é confiável, já que `main()` sempre grava com nome `.xlsx` fixo) e usa
+> `pyxlsb` automaticamente quando necessário.
+>
+> ⚠️ **Atenção com `estrutura_entidades_cc` em .xlsb**: `pyxlsb` não recalcula
+> fórmulas, só devolve o valor bruto armazenado no arquivo (diferente do `openpyxl`
+> com `data_only=True`, usado para `.xlsx`, que traz o valor já calculado pelo
+> Excel). Se esse cadastro específico depender de fórmulas, confira se os valores da
+> aba "Centros de Custo" saíram corretos — um WARNING é emitido no log sempre que
+> esse input vier em `.xlsb`. Sem esse input, a aba sai vazia; não impede a execução.
 
 ### OutputFields
 | code | nome | tipo |
