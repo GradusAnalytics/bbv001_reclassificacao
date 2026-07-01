@@ -2,7 +2,7 @@
     "containerDefinitions": [
         {
             "name": "container",
-            "image": "381491825479.dkr.ecr.us-east-1.amazonaws.com/bbv001_reclassificacao_ecs:dev",
+            "image": "381491825479.dkr.ecr.us-east-1.amazonaws.com/bbv001_reclassificacao_ecs:prd",
             "cpu": 0,
             "portMappings": [
                 {
@@ -32,7 +32,7 @@
                 "logDriver": "awslogs",
                 "options": {
                     "awslogs-create-group": "true",
-                    "awslogs-group": "/ecs/dev/bbv001_reclassificacao_ecs",
+                    "awslogs-group": "/ecs/prd/bbv001_reclassificacao_ecs",
                     "awslogs-region": "us-east-1",
                     "awslogs-stream-prefix": "ecs"
                 },
@@ -40,7 +40,7 @@
             }
         }
     ],
-    "family": "dev-bbv001_reclassificacao_ecs",
+    "family": "prd-bbv001_reclassificacao_ecs",
     "executionRoleArn": "arn:aws:iam::381491825479:role/ecsTaskExecutionRole",
     "networkMode": "awsvpc",
     "volumes": [],
