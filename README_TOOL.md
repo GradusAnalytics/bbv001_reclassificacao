@@ -85,6 +85,7 @@ nomes usados no `main()` e no dict de saída.
 | `base_final` | Base consolidada final | Arquivo |
 | `base_reclassificador` | Base para reclassificador | Arquivo |
 | `auditoria` | Auditoria por Tipo | **Tabela** |
+| `valor_por_pacote` | Valor por Pacote (antes/depois reclassificação) | **Tabela** |
 | `log_execucao` | Log de execução | Texto longo |
 | `excecoes` | Exceções — não cadastrados (Excel 2 abas) | Arquivo |
 
@@ -100,7 +101,30 @@ nomes usados no `main()` e no dict de saída.
 |---|---|---|---|
 | `tipo` | Tipo | Texto | 1 |
 | `registros` | Registros | Inteiro | 2 |
-| `soma_valor` | Soma do Valor | Float | 3 |
+| `soma_valor` | Soma do Valor | **Texto** | 3 |
+
+### Colunas da tabela `valor_por_pacote` (ColunaTabelaOutput, no OutputField `valor_por_pacote`)
+| code | nome | tipo | ordem |
+|---|---|---|---|
+| `pacote` | Pacote | Texto | 1 |
+| `valor_antes_reclassf` | Valor antes Reclassf. | **Texto** | 2 |
+| `valor_pos_reclassf` | Valor pós Reclassf. | **Texto** | 3 |
+
+> **NOVO** (não existe no Alteryx). Uma linha por Pacote (`engine/config.py` → coluna
+> `PACOTE` da Estrutura de Contas), comparando o Valor somado ANTES de toda a cascata
+> de classificação (Pacote da Conta Contabil original do lançamento) × DEPOIS dela
+> (Pacote da Conta destino final, recalculado contra a Estrutura de Contas já que a
+> Conta destino só é decidida ao fim da cascata — não é específico do Reclassificador
+> via API, qualquer um dos 6 caminhos de classificação pode mudar o Pacote de um
+> lançamento). Lançamentos cuja Conta destino não tem match na Estrutura de Contas
+> (ex.: a conta hardcoded de Consultoria) caem no bucket `"(sem pacote)"`, para o total
+> nunca perder Valor. A soma de `valor_antes_reclassf` sempre bate com a de
+> `valor_pos_reclassf` (é o mesmo Valor total, só reagrupado por Pacote diferente).
+
+> `soma_valor`, `valor_antes_reclassf` e `valor_pos_reclassf` vêm formatados como
+> **texto** no padrão BR (`_fmt_valor_br` em `bbv001_reclassificacao.py`): separador
+> de milhar `.`, decimal `,`, sempre 2 casas (ex.: `1.234.567,89`) — por isso o tipo
+> do campo no PPR é Texto, não Float/Numérico.
 
 (O `main()` ainda devolve `run_mode` = "1"/"2"; opcionalmente crie um OutputField
 `run_mode` tipo Texto curto se quiser exibi-lo.)

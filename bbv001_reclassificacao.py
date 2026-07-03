@@ -16,7 +16,8 @@ Inputs  (InputField.code): base_fechamento, depara_custo, classe_valor_conta,
                            um override manual: se informado, pula a chamada à API e usa o
                            arquivo fornecido diretamente.
 Outputs (OutputField.code): base_final (arquivo), base_reclassificador (arquivo),
-                            auditoria (tabela), log_execucao (texto_longo).
+                            auditoria (tabela), valor_por_pacote (tabela),
+                            log_execucao (texto_longo).
 
 O engine BBV001 fica em ./engine e NÃO é alterado — paridade com o Alteryx.
 
@@ -122,6 +123,13 @@ def _write_input(file_obj, dest):
     return True
 
 
+def _fmt_valor_br(value):
+    """Formata um float como string no padrão BR: milhar '.', decimal ',', 2 casas
+    (ex.: 1234567.891 -> "1.234.567,89"). Sem depender de locale (pt_BR pode não
+    estar instalado na imagem Docker)."""
+    return f"{value:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+
+
 def _read_bytesio(name):
     p = os.path.join(OUT_DIR, name)
     if not os.path.exists(p):
@@ -193,12 +201,24 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
             audit_rows.append({
                 "tipo": str(r["Tipo"]),
                 "registros": int(r["registros"]),
-                "soma_valor": round(float(r["soma_valor"]), 2),
+                "soma_valor": _fmt_valor_br(float(r["soma_valor"])),
+            })
+
+    # 4b) Valor por Pacote, antes × depois da reclassificação (output tipo=tabela)
+    pacote_rows = []
+    pacote_report = result.get("pacote_report")
+    if pacote_report is not None:
+        for _, r in pacote_report.iterrows():
+            pacote_rows.append({
+                "pacote": str(r["Pacote"]),
+                "valor_antes_reclassf": _fmt_valor_br(float(r["Valor antes Reclassf."])),
+                "valor_pos_reclassf": _fmt_valor_br(float(r["Valor pós Reclassf."])),
             })
 
     # 5) Monta os parâmetros de saída
     parametros_saida = {
         "auditoria": json.dumps(audit_rows, ensure_ascii=False),
+        "valor_por_pacote": json.dumps(pacote_rows, ensure_ascii=False),
         "log_execucao": buf.getvalue(),
         # A etapa de reclassificação sempre roda agora (override manual ou via API a
         # reclassificador_predicao_bbv001, que já tem seus próprios defaults) — "Run 1"
