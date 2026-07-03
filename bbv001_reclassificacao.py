@@ -8,13 +8,13 @@ Contrato gradus-platform (ver dummy_repo):
     e o nome vai em "<código>__nome". O wrapper sobe os arquivos ao S3 e faz o callback.
 
 Inputs  (InputField.code): base_fechamento, depara_custo, classe_valor_conta,
-                           estrutura_contas, estrutura_entidades_cc (opcional),
-                           parametros_reclassificador (opcional), modelo_reclassificador
-                           (opcional) — usados por engine.reclassifier_bridge para
-                           chamar reclassificador_predicao via API do PPR e integrar o
-                           resultado na mesma execução. base_reclassificada (opcional)
-                           agora é só um override manual: se informado, pula a chamada
-                           à API e usa o arquivo fornecido diretamente.
+                           estrutura_contas, estrutura_entidades_cc (opcional).
+                           A etapa de reclassificação chama, via engine.reclassifier_bridge,
+                           a ferramenta reclassificador_predicao_bbv001 (API do PPR), que já
+                           usa seus próprios arquivos default de modelo/parâmetros — não são
+                           mais inputs desta ferramenta. base_reclassificada (opcional) é só
+                           um override manual: se informado, pula a chamada à API e usa o
+                           arquivo fornecido diretamente.
 Outputs (OutputField.code): base_final (arquivo), base_reclassificador (arquivo),
                             auditoria (tabela), log_execucao (texto_longo).
 
@@ -77,8 +77,7 @@ def _read_bytesio(name):
 
 
 def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
-         estrutura_contas=None, base_reclassificada=None, estrutura_entidades_cc=None,
-         parametros_reclassificador=None, modelo_reclassificador=None):
+         estrutura_contas=None, base_reclassificada=None, estrutura_entidades_cc=None):
     import pandas as pd
 
     # 1) Diretórios limpos por execução
@@ -102,9 +101,6 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
     df_reclass_override = None
     if base_reclassificada is not None:
         df_reclass_override = pd.read_excel(base_reclassificada, sheet_name="Sheet1")
-    has_reclass = df_reclass_override is not None or (
-        parametros_reclassificador is not None and modelo_reclassificador is not None
-    )
 
     # 2) Captura do log (log_step do engine)
     buf = io.StringIO()
@@ -120,11 +116,7 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
     os.environ["BBV001_BASE_FILE"] = CANON["base_fechamento"]
 
     import pipeline
-    result = pipeline.run_pipeline(
-        parametros_reclassificador=parametros_reclassificador,
-        modelo_reclassificador=modelo_reclassificador,
-        base_reclassificada_override=df_reclass_override,
-    )
+    result = pipeline.run_pipeline(base_reclassificada_override=df_reclass_override)
 
     # 4) Auditoria por Tipo (output tipo=tabela → JSON array de linhas)
     audit_rows = []
@@ -145,7 +137,10 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
     parametros_saida = {
         "auditoria": json.dumps(audit_rows, ensure_ascii=False),
         "log_execucao": buf.getvalue(),
-        "run_mode": str(2 if has_reclass else 1),
+        # A etapa de reclassificação sempre roda agora (override manual ou via API a
+        # reclassificador_predicao_bbv001, que já tem seus próprios defaults) — "Run 1"
+        # sem reclassificação não existe mais.
+        "run_mode": "2",
     }
     final_io = _read_bytesio(FINAL_NAME)
     if final_io is not None:
