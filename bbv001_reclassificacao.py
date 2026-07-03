@@ -19,13 +19,23 @@ Outputs (OutputField.code): base_final (arquivo), base_reclassificador (arquivo)
                             auditoria (tabela), log_execucao (texto_longo).
 
 O engine BBV001 fica em ./engine e NÃO é alterado — paridade com o Alteryx.
+
+NOTA (conversão xlsb): alguns inputs chegam em .xlsb "fora do padrão" (ex.: exportações
+de ERP) que openpyxl/calamine/pyxlsb não leem corretamente — pyxlsb inclusive lê só a
+primeira coluna e descarta o resto silenciosamente. Esses bytes são normalizados para
+.xlsx via LibreOffice headless (ver _normalize_to_xlsx_bytes) antes de qualquer leitura.
+Requer o pacote libreoffice-calc na imagem Docker.
 """
 import io
 import os
 import sys
 import json
 import shutil
+import zipfile
 import logging
+import tempfile
+import subprocess
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine"))
 
@@ -45,10 +55,49 @@ RECL_NAME = "BBV001-Base_para_reclassificador.xlsx"
 EXCECOES_NAME = "BBV001-Excecoes_nao_cadastrados.xlsx"
 
 
-def _write_input(file_obj, dest):
-    """Grava o input (file-like / bytes / caminho) em dest. Retorna True se gravou."""
-    if file_obj is None:
+def _is_xlsb(data):
+    """xlsb e xlsx são ambos ZIP (magic 'PK'); o que distingue é o interior:
+    xlsb contém xl/workbook.bin, xlsx contém xl/workbook.xml."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            return "xl/workbook.bin" in z.namelist()
+    except zipfile.BadZipFile:
         return False
+
+
+def _xlsb_to_xlsx_bytes(data):
+    """Converte bytes de um .xlsb em bytes de .xlsx via LibreOffice headless.
+    Necessário porque os parsers .xlsb do Python (openpyxl/calamine/pyxlsb)
+    falham ou corrompem silenciosamente arquivos fora do padrão."""
+    binario = shutil.which("libreoffice") or shutil.which("soffice")
+    if not binario:
+        raise RuntimeError(
+            "LibreOffice não encontrado. Instale 'libreoffice-calc' na imagem Docker."
+        )
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "in.xlsb"
+        src.write_bytes(data)
+        # UserInstallation isolado: resolve HOME não-gravável e conversões concorrentes
+        subprocess.run(
+            [binario, "-env:UserInstallation=file://" + tmp + "/prof",
+             "--headless", "--convert-to", "xlsx", "--outdir", tmp, str(src)],
+            check=True, capture_output=True, timeout=180,
+        )
+        out = Path(tmp) / "in.xlsx"
+        if not out.exists():
+            raise RuntimeError("Conversão LibreOffice não gerou o .xlsx esperado.")
+        return out.read_bytes()
+
+
+def _normalize_to_xlsx_bytes(data):
+    """Se os bytes forem .xlsb, converte para .xlsx; senão devolve intactos."""
+    return _xlsb_to_xlsx_bytes(data) if _is_xlsb(data) else data
+
+
+def _read_bytes(file_obj):
+    """Extrai bytes de um input (file-like / bytes / caminho). None se vazio."""
+    if file_obj is None:
+        return None
     if hasattr(file_obj, "read"):
         data = file_obj.read()
     elif isinstance(file_obj, (bytes, bytearray)):
@@ -57,9 +106,17 @@ def _write_input(file_obj, dest):
         with open(file_obj, "rb") as fh:
             data = fh.read()
     else:
+        return None
+    return data or None
+
+
+def _write_input(file_obj, dest):
+    """Grava o input em dest, normalizando xlsb→xlsx quando necessário.
+    Retorna True se gravou."""
+    data = _read_bytes(file_obj)
+    if data is None:
         return False
-    if not data:
-        return False
+    data = _normalize_to_xlsx_bytes(data)  # xlsb "fantasiado" de .xlsx vira xlsx real
     with open(dest, "wb") as out:
         out.write(data)
     return True
@@ -98,9 +155,15 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
     # base_reclassificada agora é só o override manual (pula a chamada à API do PPR
     # em reclassifier_bridge quando informado) — lido direto em memória, não escrito
     # em disco, já que pipeline.run_pipeline() espera um DataFrame.
+    # Normaliza xlsb→xlsx também aqui, pois este input não passa por _write_input.
     df_reclass_override = None
     if base_reclassificada is not None:
-        df_reclass_override = pd.read_excel(base_reclassificada, sheet_name="Sheet1")
+        _raw = _read_bytes(base_reclassificada)
+        if _raw is not None:
+            _xlsx = _normalize_to_xlsx_bytes(_raw)
+            # Não fixamos o nome da aba: pegamos sempre a primeira (índice 0),
+            # pois xlsb/xlsx desta origem têm nomes de aba variáveis.
+            df_reclass_override = pd.read_excel(io.BytesIO(_xlsx), sheet_name=0)
 
     # 2) Captura do log (log_step do engine)
     buf = io.StringIO()
