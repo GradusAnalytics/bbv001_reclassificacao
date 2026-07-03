@@ -33,6 +33,7 @@ from helpers import (
     getright,
     alteryx_join,
     log_step,
+    _normalize_join_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -240,9 +241,11 @@ def consolidate_cobranca(df_cobranca_overridden: pd.DataFrame) -> pd.DataFrame:
     df["Tipo"] = "Cobrança"   # Tool 101
     log_step(logger, "101", "Cobrança: assign Tipo", df)
 
-    # Tool 99 — drop helper columns
-    drop_cols = ["Conta GCUT", "Pacote GCUT", "HISTORICO2",
-                 "Nome do Fornecedor", "FINALIZACAO", "GRUPO"]
+    # Tool 99 — drop helper columns. "Pacote GCUT" is kept (not dropped like in the
+    # original Alteryx Tool 99): it feeds the NOVO relatório de Valor por Pacote
+    # (build_pacote_report) — it's never selected into FINAL_OUTPUT_SCHEMA, so the
+    # actual final_consolidated file is unaffected.
+    drop_cols = ["Conta GCUT", "HISTORICO2", "Nome do Fornecedor", "FINALIZACAO", "GRUPO"]
     df = df.drop(columns=[c for c in drop_cols if c in df.columns])
     log_step(logger, "99", "Cobrança: drop helper columns", df)
     return df
@@ -278,7 +281,9 @@ def finalize_match_conta_classe(df_matched: pd.DataFrame) -> pd.DataFrame:
     df = df_matched.copy()
     df["Conta destino"] = df["Conta Contabil"]    # Tool 93
     df["Tipo"] = "Match conta x classe"           # Tool 102
-    drop_cols = ["Conta GCUT", "Pacote GCUT", "HISTORICO2", "Nome do Fornecedor"]
+    # "Pacote GCUT" é mantida (ver nota em consolidate_cobranca) para o relatório de
+    # Valor por Pacote — não afeta o schema final (Tool 96/114).
+    drop_cols = ["Conta GCUT", "HISTORICO2", "Nome do Fornecedor"]
     df = df.drop(columns=[c for c in drop_cols if c in df.columns])
     log_step(logger, "93+102+96", "Finalize Match conta × classe", df)
     return df
@@ -316,7 +321,8 @@ def finalize_match_classe_conta_om(df_matched: pd.DataFrame) -> pd.DataFrame:
     df = df_matched.copy()
     df["Conta destino"] = df["Conta Contabil"]    # Tool 94
     df["Tipo"] = "Match classe conta OM"          # Tool 103
-    drop_cols = ["Conta GCUT", "Pacote GCUT", "HISTORICO2", "Nome do Fornecedor"]
+    # "Pacote GCUT" mantida — ver nota em consolidate_cobranca.
+    drop_cols = ["Conta GCUT", "HISTORICO2", "Nome do Fornecedor"]
     df = df.drop(columns=[c for c in drop_cols if c in df.columns])
     log_step(logger, "94+103+97", "Finalize Match classe conta OM", df)
     return df
@@ -384,7 +390,8 @@ def finalize_consultoria(df_consultoria: pd.DataFrame) -> pd.DataFrame:
     df = df_consultoria.copy()
     df["Conta destino"] = CONSULTORIA_CONTA_DESTINO  # Tool 119
     df["Tipo"] = "Consultorias"                       # Tool 119
-    drop_cols = ["Conta GCUT", "Pacote GCUT", "HISTORICO2", "Nome do Fornecedor", "F1"]
+    # "Pacote GCUT" mantida — ver nota em consolidate_cobranca.
+    drop_cols = ["Conta GCUT", "HISTORICO2", "Nome do Fornecedor", "F1"]
     df = df.drop(columns=[c for c in drop_cols if c in df.columns])
     log_step(logger, "119+120", "Finalize Consultorias", df)
     return df
@@ -433,7 +440,8 @@ def finalize_arbitrado(df_matched: pd.DataFrame) -> pd.DataFrame:
             "Conta destino will be missing. Verify the Unico CV column name."
         )
     df["Tipo"] = "Arbitrado classe"        # Tool 104
-    drop_cols = ["Conta GCUT", "Pacote GCUT", "HISTORICO2", "Nome do Fornecedor", "F1"]
+    # "Pacote GCUT" mantida — ver nota em consolidate_cobranca.
+    drop_cols = ["Conta GCUT", "HISTORICO2", "Nome do Fornecedor", "F1"]
     df = df.drop(columns=[c for c in drop_cols if c in df.columns])
     log_step(logger, "104+98", "Finalize Arbitrado", df)
     return df
@@ -548,8 +556,8 @@ def integrate_reclassified(
     combined["Tipo"] = "Reclassificador"
     log_step(logger, "127", "Tipo = Reclassificador", combined)
 
-    # Tool 128 — drop helpers
-    drop_cols = ["Conta GCUT", "Pacote GCUT", "HISTORICO2", "Nome do Fornecedor", "F1"]
+    # Tool 128 — drop helpers. "Pacote GCUT" mantida — ver nota em consolidate_cobranca.
+    drop_cols = ["Conta GCUT", "HISTORICO2", "Nome do Fornecedor", "F1"]
     combined = combined.drop(columns=[c for c in drop_cols if c in combined.columns])
     log_step(logger, "128", "Drop helpers", combined)
     return combined
@@ -685,3 +693,48 @@ def build_exceptions(dropped_contas, df_base_raw, df_cc_cadastro):
     log_step(logger, "201", "Exceções — Centros de Custo não cadastrados", centros)
 
     return {"contas": contas, "centros_custo": centros}
+
+
+# =========================================================================
+# NOVO — VALOR POR PACOTE (antes × depois da cascata de classificação) —
+# não existe no Alteryx
+# =========================================================================
+def build_pacote_report(df_unioned: pd.DataFrame, df_estrutura: pd.DataFrame) -> pd.DataFrame:
+    """
+    Monta a comparação de Valor por Pacote antes × depois de toda a cascata de
+    classificação (não só do Reclassificador via API — qualquer um dos 6 caminhos
+    pode levar um lançamento a uma Conta destino de Pacote diferente do original).
+
+    "Antes": Pacote GCUT, já calculado no Tool 62 a partir da Conta Contabil
+    ORIGINAL do lançamento (join × Estrutura de Contas), preservado até aqui em vez
+    de descartado nos Tools 99/96/97/120/98/128.
+    "Depois": Pacote da Conta destino final — recalculado aqui cruzando de novo com
+    a Estrutura de Contas, já que Conta destino só é decidida ao fim da cascata.
+
+    Contas destino sem match na Estrutura (ex.: a conta hardcoda de Consultoria) e
+    Pacotes em branco caem no bucket "(sem pacote)", para não perder Valor do total.
+    """
+    lookup = (
+        df_estrutura[["CONTA CONTÁBIL", "PACOTE"]]
+        .assign(_jk=lambda d: _normalize_join_key(d["CONTA CONTÁBIL"]))
+        .dropna(subset=["_jk"])
+        .drop_duplicates(subset="_jk")
+        .set_index("_jk")["PACOTE"]
+    )
+    pacote_destino = (
+        _normalize_join_key(df_unioned["Conta destino"]).map(lookup).fillna("(sem pacote)")
+    )
+    pacote_origem = df_unioned["Pacote GCUT"].fillna("(sem pacote)")
+
+    antes = df_unioned.groupby(pacote_origem)["Valor"].sum()
+    antes.index.name = "Pacote"
+    depois = df_unioned.groupby(pacote_destino)["Valor"].sum()
+    depois.index.name = "Pacote"
+
+    report = pd.concat(
+        [antes.rename("Valor antes Reclassf."), depois.rename("Valor pós Reclassf.")],
+        axis=1,
+    ).fillna(0.0).reset_index()
+    report = report.sort_values("Pacote").reset_index(drop=True)
+    log_step(logger, "NOVO", "Valor por Pacote (antes × depois)", report)
+    return report

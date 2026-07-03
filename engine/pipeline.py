@@ -124,6 +124,11 @@ def run_pipeline(base_reclassificada_override=None) -> dict:
     exceptions = t.build_exceptions(dropped_contas, df_base, df_cc_cad)
 
     # -------------------------------------------------------------------
+    # NOVO — VALOR POR PACOTE (antes × depois da cascata de classificação)
+    # -------------------------------------------------------------------
+    pacote_report = t.build_pacote_report(unioned, df_estrutura)
+
+    # -------------------------------------------------------------------
     # WRITE OUTPUTS
     # -------------------------------------------------------------------
     path_reclass = io.write_reclassifier_base(reclassifier_base)
@@ -141,6 +146,7 @@ def run_pipeline(base_reclassificada_override=None) -> dict:
         "path_reclass": path_reclass,
         "path_final": path_final,
         "exceptions": exceptions,   # {"contas": df, "centros_custo": df}
+        "pacote_report": pacote_report,
         # Intermediates for debugging
         "_intermediates": {
             "enriched": df_enriched,
