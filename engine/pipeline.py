@@ -15,18 +15,14 @@ import transforms as t
 logger = logging.getLogger(__name__)
 
 
-def run_pipeline(
-    parametros_reclassificador=None,
-    modelo_reclassificador=None,
-    base_reclassificada_override=None,
-) -> dict:
+def run_pipeline(base_reclassificada_override=None) -> dict:
     """
     Execute the full pipeline.
 
-    parametros_reclassificador / modelo_reclassificador: arquivos (file-like) usados
-    pela ponte reclassifier_bridge para chamar reclassificador_predicao via API do
-    PPR. base_reclassificada_override: se informado, pula a chamada à API e usa esse
-    DataFrame diretamente — mantém o fluxo manual antigo como plano B.
+    base_reclassificada_override: se informado, pula a chamada à API (feita via
+    reclassifier_bridge para a ferramenta reclassificador_predicao_bbv001, que já usa
+    seus próprios arquivos default de modelo/parâmetros) e usa esse DataFrame
+    diretamente — mantém o fluxo manual antigo como plano B.
 
     Returns a dict of intermediate DataFrames for inspection/testing,
     plus paths to the two output files.
@@ -104,10 +100,8 @@ def run_pipeline(
         logger.info("[Bridge] Usando base_reclassificada informada manualmente (pulando chamada à API).")
         df_reclass = base_reclassificada_override
     else:
-        logger.info("[Bridge] Chamando reclassificador_predicao via API do PPR...")
-        df_reclass = reclassifier_bridge.run_predicao_via_api(
-            reclassifier_base, parametros_reclassificador, modelo_reclassificador,
-        )
+        logger.info("[Bridge] Chamando reclassificador_predicao_bbv001 via API do PPR...")
+        df_reclass = reclassifier_bridge.run_predicao_via_api(reclassifier_base)
 
     reclassificador_final = t.integrate_reclassified(for_reclass, df_reclass)
 

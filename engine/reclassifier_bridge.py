@@ -4,10 +4,15 @@ reclassifier_bridge.py — Chama a etapa de reclassificação manual via API do 
 Substitui o processo manual de "Run 1 -> baixa base_reclassificador -> roda
 reclassificador_predicao por fora -> sobe base_reclassificada -> Run 2": esta ponte
 traduz a base_reclassificador (schema RECLASSIFIER_OUTPUT_SCHEMA) para o formato
-esperado pela ferramenta reclassificador_predicao já publicada no PPR, dispara a
-execução via API pública (docs/api_implementation_plan.md do repo
+esperado pela ferramenta reclassificador_predicao_bbv001 já publicada no PPR, dispara
+a execução via API pública (docs/api_implementation_plan.md do repo
 PlataformaPrototipagem), espera o resultado por polling e devolve o
 base_reclassificada já parseado em DataFrame.
+
+reclassificador_predicao_bbv001 é uma ferramenta dedicada ao BBV001 que já usa
+arquivos default (modelo + parâmetros do reclassificador) configurados do lado dela
+no PPR — por isso esta ponte só precisa subir a base traduzida, sem enviar
+arquivo_param/reclassificador a cada chamada.
 
 Credenciais AWS (aws_access_key_id / aws_secret_access_key) são lidas do ambiente do
 processo — mesmas variáveis que o dispatcher generic_tool do PPR já injeta em toda
@@ -27,7 +32,7 @@ import config as cfg
 
 logger = logging.getLogger(__name__)
 
-# Tool 122 (BBV001) -> Base esperada pelo reclassificador_predicao (Param_Reclassificador)
+# Tool 122 (BBV001) -> Base esperada pelo reclassificador_predicao_bbv001 (Param_Reclassificador)
 RENAME_TO_PREDICAO = {
     "Codigo Interno": "Chave única",
     "Conta Contabil": "Cód Conta Contábil",
@@ -41,9 +46,10 @@ class ReclassifierBridgeError(RuntimeError):
 
 def build_predicao_base(df_for_reclass: pd.DataFrame) -> io.BytesIO:
     """Traduz o schema do Tool 122 (base_reclassificador) para a 'Base' que o
-    reclassificador_predicao espera, aplicando apenas as 3 renomeações necessárias.
-    Colunas extras (Conta destino, Como tratar?, FINALIZACAO, GRUPO) são mantidas —
-    o reclassificador_predicao só lê as colunas que precisa, o resto é ignorado.
+    reclassificador_predicao_bbv001 espera, aplicando apenas as 3 renomeações
+    necessárias. Colunas extras (Conta destino, Como tratar?, FINALIZACAO, GRUPO) são
+    mantidas — o reclassificador_predicao_bbv001 só lê as colunas que precisa, o resto
+    é ignorado.
     """
     df = df_for_reclass.rename(columns=RENAME_TO_PREDICAO)
     buf = io.BytesIO()
@@ -145,25 +151,19 @@ def _download_output(status_body: dict, code: str = "output") -> pd.DataFrame:
     return pd.read_excel(io.BytesIO(resp.content))
 
 
-def run_predicao_via_api(
-    reclassifier_base_df: pd.DataFrame,
-    parametros_reclassificador_file,
-    modelo_reclassificador_file,
-) -> pd.DataFrame:
-    """Dispara reclassificador_predicao via API do PPR e devolve base_reclassificada
-    já parseada em DataFrame (colunas mínimas garantidas: 'Chave única' e
-    'Conta ajustada', consumidas por transforms.integrate_reclassified).
+def run_predicao_via_api(reclassifier_base_df: pd.DataFrame) -> pd.DataFrame:
+    """Dispara reclassificador_predicao_bbv001 via API do PPR e devolve
+    base_reclassificada já parseada em DataFrame (colunas mínimas garantidas:
+    'Chave única' e 'Conta ajustada', consumidas por transforms.integrate_reclassified).
+
+    arquivo_param e reclassificador não são enviados: a ferramenta
+    reclassificador_predicao_bbv001 já tem seus próprios arquivos default (modelo +
+    parâmetros) configurados no PPR.
     """
     if not cfg.PPR_API_TOKEN:
         raise ReclassifierBridgeError(
             "PPR_API_TOKEN não configurado — necessário para chamar "
             f"{cfg.RECLASSIFICADOR_PREDICAO_TOOLNAME} via API do PPR."
-        )
-    if parametros_reclassificador_file is None or modelo_reclassificador_file is None:
-        raise ReclassifierBridgeError(
-            "parametros_reclassificador e modelo_reclassificador são obrigatórios "
-            "para a etapa de reclassificação via API (ou informe base_reclassificada "
-            "manualmente para pular esta etapa)."
         )
 
     run_id = uuid.uuid4()
@@ -173,17 +173,7 @@ def run_predicao_via_api(
         _read_bytes(build_predicao_base(reclassifier_base_df)),
         f"{scratch_prefix}/base.xlsx",
     )
-    param_key = _upload_bytes(
-        _read_bytes(parametros_reclassificador_file),
-        f"{scratch_prefix}/parametros.xlsx",
-    )
-    modelo_key = _upload_bytes(
-        _read_bytes(modelo_reclassificador_file),
-        f"{scratch_prefix}/modelo.pkl",
-    )
 
-    execution_id = _post_exec(
-        files={"arquivo": base_key, "arquivo_param": param_key, "reclassificador": modelo_key}
-    )
+    execution_id = _post_exec(files={"arquivo": base_key})
     status_body = _poll_status(execution_id)
     return _download_output(status_body, code="output")
