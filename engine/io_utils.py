@@ -5,6 +5,7 @@ One function per Alteryx Input tool. Reading and the trivial first Select
 (rename / column-type change) are bundled together where it makes sense.
 """
 import logging
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -12,41 +13,74 @@ import pandas as pd
 
 from config import (
     INPUT_FILES,
-    MANUAL_GROUP_OVERRIDES,
+    REQUIRED_COLUMNS,
     OUTPUT_RECLASSIFIER,
     OUTPUT_FINAL_CONSOLIDATED,
     OUTPUT_DIR,
 )
+from controls import BloqueioError
 from helpers import log_step
 
 logger = logging.getLogger(__name__)
 
 # Assinatura do container binário OLE2/CFB usado por formatos legados do Office
-# (.xls, .xlsb). main() sempre grava os inputs com extensão .xlsx fixa (ver CANON em
-# bbv001_reclassificacao.py), então a extensão do arquivo não é confiável para saber
-# se o conteúdo é realmente .xlsb — é preciso inspecionar os bytes.
+# (.xls e alguns .xlsb). main() sempre grava os inputs com extensão .xlsx fixa (ver
+# CANON em bbv001_reclassificacao.py), então a extensão do arquivo não é confiável
+# para saber o formato real — é preciso inspecionar os bytes.
 _OLE2_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
-def _excel_engine_for(path) -> str | None:
-    """Detecta pelos magic bytes se o arquivo é um binário OLE2/CFB (.xlsb) e, se
-    for, indica o engine 'pyxlsb'. Caso contrário, devolve None (engine padrão do
-    pandas, que já lida bem com .xlsx reais)."""
+def _detecta_xlsb(path) -> bool:
+    """V2/§3.10 — detecta .xlsb pelo CONTEÚDO, cobrindo as duas variantes reais:
+    (a) container OLE2/CFB (assinatura D0CF11E0...); (b) container ZIP ("PK") com
+    `xl/workbook.bin` no lugar do `xl/workbook.xml` — é o formato dos .xlsb de ERP
+    deste cliente, que a v1 NÃO detectava (premissa OLE2 errada) e acabava lendo via
+    pyxlsb, que devolve só a 1ª coluna em silêncio (evidência: _qa_resultados_20260708)."""
     try:
         with open(path, "rb") as fh:
             header = fh.read(8)
     except OSError:
-        return None
-    return "pyxlsb" if header.startswith(_OLE2_SIGNATURE) else None
+        return False
+    if header.startswith(_OLE2_SIGNATURE):
+        return True
+    if header[:2] == b"PK":
+        try:
+            with zipfile.ZipFile(path) as z:
+                return "xl/workbook.bin" in z.namelist()
+        except zipfile.BadZipFile:
+            return False
+    return False
 
 
 def _read_excel(path, **kwargs):
-    """Wrapper de pd.read_excel que detecta .xlsb pelo conteúdo (não pela extensão)
-    e seleciona o engine correto automaticamente."""
-    engine = _excel_engine_for(path)
-    if engine:
-        kwargs = {**kwargs, "engine": engine}
+    """Wrapper de pd.read_excel. V2/§3.10 (decisão 2026-07-09): .xlsb é RECUSADO com
+    erro acionável — nenhum leitor Python disponível lê os .xlsb deste ERP de forma
+    íntegra (pyxlsb perde todas as colunas menos a 1ª, silenciosamente; calamine dá
+    panic). Na plataforma isso nunca dispara: o main() converte xlsb→xlsx via
+    LibreOffice ANTES de gravar os inputs."""
+    if _detecta_xlsb(path):
+        raise BloqueioError(
+            "FORMATO_XLSB",
+            f"O arquivo '{Path(path).name}' está em formato .xlsb, que não pode ser lido "
+            f"de forma confiável fora da plataforma. Abra o arquivo no Excel e salve como "
+            f".xlsx (Pasta de Trabalho do Excel) antes de enviar.")
     return pd.read_excel(path, **kwargs)
+
+
+def _valida_colunas(df: pd.DataFrame, input_key: str, path, sheet) -> pd.DataFrame:
+    """V2/D1 — validação pós-leitura de colunas mínimas (cinto-e-suspensório da
+    validação upfront do main). Falta de coluna vira erro acionável, não KeyError
+    críptico no meio da cascata."""
+    required = REQUIRED_COLUMNS.get(input_key, [])
+    faltando = [c for c in required if c not in df.columns]
+    if faltando:
+        raise BloqueioError(
+            "COLUNAS_FALTANDO",
+            f"O input '{input_key}' (arquivo '{Path(path).name}', aba '{sheet}') não tem "
+            f"as colunas obrigatórias: {faltando}. Colunas encontradas: "
+            f"{list(df.columns)[:20]}. Verifique se o arquivo/aba corretos foram enviados "
+            f"e se o template não mudou.")
+    return df
 
 
 def _read_excel_with_header_marker(path, sheet, marker: str, max_scan: int = 15) -> pd.DataFrame:
@@ -86,14 +120,16 @@ def read_base_fechamento() -> pd.DataFrame:
     df["Conta Contabil"] = df["Conta Contabil"].apply(
         lambda v: v if (isinstance(v, str) or (isinstance(v, float) and pd.isna(v))) else str(v)
     )
+    _valida_colunas(df, "base_fechamento", cfg["path"], cfg["sheet"])  # V2/D1
     log_step(logger, "4", "Read Base Fechamento + rename Valor", df)
     return df
 
 
 def read_depara_custo() -> pd.DataFrame:
-    """Tool 10."""
+    """Tool 10. V2/R3: DATA_BASE agora é coluna obrigatória (resolução por recência)."""
     cfg = INPUT_FILES["depara_custo"]
     df = _read_excel(cfg["path"], sheet_name=cfg["sheet"])
+    _valida_colunas(df, "depara_custo", cfg["path"], cfg["sheet"])  # V2/D1
     log_step(logger, "10", "Read De-Para Custo", df)
     return df
 
@@ -102,6 +138,7 @@ def read_classe_valor_conta() -> pd.DataFrame:
     """Tool 47 — sheet 'Base' (real header below a few title rows)."""
     cfg = INPUT_FILES["classe_valor_conta"]
     df = _read_excel_with_header_marker(cfg["path"], cfg["sheet_base"], "Nome classe de valor")
+    _valida_colunas(df, "classe_valor_conta_base", cfg["path"], cfg["sheet_base"])  # V2/D1
     log_step(logger, "47", "Read Classe Valor x Conta (Base)", df)
     return df
 
@@ -110,6 +147,7 @@ def read_unico_cv() -> pd.DataFrame:
     """Tool 48 — sheet 'Unico CV' (real header below a few title rows)."""
     cfg = INPUT_FILES["classe_valor_conta"]
     df = _read_excel_with_header_marker(cfg["path"], cfg["sheet_unico_cv"], "Classe de valor")
+    _valida_colunas(df, "classe_valor_conta_unico_cv", cfg["path"], cfg["sheet_unico_cv"])  # V2/D1
     log_step(logger, "48", "Read Unico CV", df)
     return df
 
@@ -118,7 +156,32 @@ def read_estrutura_contas() -> pd.DataFrame:
     """Tool 61."""
     cfg = INPUT_FILES["estrutura_contas"]
     df = _read_excel(cfg["path"], sheet_name=cfg["sheet"])
+    _valida_colunas(df, "estrutura_contas", cfg["path"], cfg["sheet"])  # V2/D1
     log_step(logger, "61", "Read Estrutura de Contas", df)
+    return df
+
+
+def read_depara_grupos() -> pd.DataFrame:
+    """V2/R4 (NOVO) — de-para GRUPO → Conta OM / Conta Contábil. Input OBRIGATÓRIO;
+    substitui os 11 overrides hardcoded do Tool 86. Template: 1 aba, header na
+    linha 1, colunas Grupo · Conta OM · Conta Contábil (seed em
+    aux_files/gera_seed_depara_grupos.py)."""
+    cfg = INPUT_FILES["depara_grupos"]
+    path: Path = cfg["path"]
+    if not path.exists():
+        raise BloqueioError(
+            "INPUT_OBRIGATORIO_AUSENTE",
+            "O input 'depara_grupos' (De-Para de Grupos de Cobrança → Conta) é obrigatório "
+            "e não foi enviado. Use o template de 3 colunas (Grupo · Conta OM · Conta "
+            "Contábil) — sem ele não é possível classificar o caminho Cobrança.")
+    df = _read_excel(path, sheet_name=cfg["sheet"])
+    _valida_colunas(df, "depara_grupos", path, cfg["sheet"])  # V2/D1
+    # Cadastro mantido pelo usuário: strip nas 3 colunas de texto (contrato do
+    # template — evita não-match por espaço acidental; não afeta a paridade dos
+    # joins portados do Alteryx, que seguem byte-a-byte).
+    for col in ("Grupo", "Conta OM", "Conta Contábil"):
+        df[col] = df[col].apply(lambda v: v.strip() if isinstance(v, str) else v)
+    log_step(logger, "R4", "Read De-Para Grupos (novo input obrigatório)", df)
     return df
 
 
@@ -165,15 +228,16 @@ def read_estrutura_entidades_cc() -> Optional[pd.DataFrame]:
         )
         return None
     try:
-        if _excel_engine_for(path) == "pyxlsb":
+        if _detecta_xlsb(path):
+            # V2/§3.10: sem leitor confiável de .xlsb fora da plataforma (pyxlsb
+            # devolve só a 1ª coluna em silêncio). Input é OPCIONAL → warning e aba
+            # vazia, em vez de derrubar a execução.
             logger.warning(
-                "[Tool 200] cadastro de CC recebido em .xlsb — pyxlsb não recalcula "
-                "fórmulas (só openpyxl com data_only=True faz isso); se o cadastro "
-                "depender de fórmulas, confira se os valores saíram corretos."
+                "[Tool 200] cadastro de CC recebido em .xlsb — formato não pode ser lido "
+                "de forma confiável; salve como .xlsx e reenvie. A aba 'Centros de Custo' "
+                "do relatório de exceções ficará vazia nesta execução."
             )
-            xls = pd.ExcelFile(path, engine="pyxlsb")
-            sheet = cfg["sheet"] if cfg["sheet"] in xls.sheet_names else xls.sheet_names[0]
-            df = xls.parse(sheet)
+            return None
         else:
             from openpyxl import load_workbook
             wb = load_workbook(path, read_only=True, data_only=True)
@@ -195,11 +259,8 @@ def read_estrutura_entidades_cc() -> Optional[pd.DataFrame]:
     return df
 
 
-def get_manual_overrides() -> pd.DataFrame:
-    """Tool 86 — hardcoded TextInput, 11 rows."""
-    df = pd.DataFrame(MANUAL_GROUP_OVERRIDES)
-    log_step(logger, "86", "Manual Grupo overrides (TextInput)", df)
-    return df
+# V2/R4: get_manual_overrides() (Tool 86, 11 linhas hardcoded) foi REMOVIDA —
+# o de-para de grupos agora entra pelo input obrigatório read_depara_grupos() acima.
 
 
 # -------------------------------------------------------------------------
