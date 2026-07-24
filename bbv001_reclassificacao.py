@@ -8,18 +8,29 @@ Contrato gradus-platform (ver dummy_repo):
     e o nome vai em "<código>__nome". O wrapper sobe os arquivos ao S3 e faz o callback.
 
 Inputs  (InputField.code): base_fechamento, depara_custo, classe_valor_conta,
-                           estrutura_contas, estrutura_entidades_cc (opcional).
+                           estrutura_contas, depara_grupos (V2/R4 — OBRIGATÓRIO, de-para
+                           GRUPO→Conta que substitui os 11 overrides hardcoded),
+                           estrutura_entidades_cc (opcional).
                            A etapa de reclassificação chama, via engine.reclassifier_bridge,
                            a ferramenta reclassificador_predicao_bbv001 (API do PPR), que já
                            usa seus próprios arquivos default de modelo/parâmetros — não são
                            mais inputs desta ferramenta. base_reclassificada (opcional) é só
                            um override manual: se informado, pula a chamada à API e usa o
-                           arquivo fornecido diretamente.
+                           arquivo fornecido diretamente. r9_modo_warning (opcional, V2/R10 —
+                           default bloqueia; pendência de tipo de campo no PPR, ver comentário
+                           em main()) alterna o R9 (bloqueio de cruzamento de prefixo) pro
+                           modo warning (sinaliza, não exclui do base_final).
 Outputs (OutputField.code): base_final (arquivo), base_reclassificador (arquivo),
                             auditoria (tabela), valor_por_pacote (tabela),
-                            log_execucao (texto_longo).
+                            warnings (tabela — V2, opcional cadastrar),
+                            log_execucao (texto_longo), excecoes (arquivo, 5 abas na V2).
 
-O engine BBV001 fica em ./engine e NÃO é alterado — paridade com o Alteryx.
+V2: o engine em ./engine ganhou controles transversais (engine/controls.py) —
+validação de inputs/cadastros, censo de duplicatas início×fim (ERRO bloqueante),
+equação de conservação entrada×saída e avisos estruturados ao usuário. As mudanças
+de comportamento aprovadas vs a v1/Alteryx estão em docs/SPEC_V2.md do projeto.
+Erros de negócio sobem como RuntimeError com mensagem acionável (o PPR exibe no
+status da execução).
 
 NOTA (conversão xlsb): alguns inputs chegam em .xlsb "fora do padrão" (ex.: exportações
 de ERP) que openpyxl/calamine/pyxlsb não leem corretamente — pyxlsb inclusive lê só a
@@ -46,7 +57,18 @@ CANON = {
     "depara_custo":         "DeXPara_Custo_Gradus.xlsx",
     "classe_valor_conta":   "BBV001-260509-Classe de Valor x Conta Contábil-v1 MU.xlsx",
     "estrutura_contas":      "20260509 - 12h30 - Estrutura de contas.xlsx",
+    "depara_grupos":         "depara_grupos.xlsx",          # V2/R4 — obrigatório
     "estrutura_entidades_cc": "estrutura_entidades_cc.xlsx",
+}
+
+# V2/D1 — inputs obrigatórios (validação upfront ANTES de rodar o engine) + nome
+# amigável para a mensagem de erro que o usuário do PPR vai ler.
+REQUIRED_INPUTS = {
+    "base_fechamento":    "Base de Fechamento (mensal)",
+    "depara_custo":       "De-Para Custo (Cobrança)",
+    "classe_valor_conta": "Classe de Valor × Conta Contábil",
+    "estrutura_contas":   "Estrutura de Contas",
+    "depara_grupos":      "De-Para de Grupos → Conta (novo na v2)",
 }
 WORK = "/tmp/bbv001"
 IN_DIR = os.path.join(WORK, "inputs")
@@ -141,9 +163,67 @@ def _read_bytesio(name):
     return b
 
 
-def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
-         estrutura_contas=None, base_reclassificada=None, estrutura_entidades_cc=None):
+def _montar_excel_excecoes(exc: dict, aviso_rows: list) -> io.BytesIO:
+    """
+    Monta o excel de exceções (5 abas na V2: Contas Contábeis, Centros de Custo,
+    Correção Automática de Conta, Bloqueio Prefixo Conta, Avisos) a partir do
+    dict devolvido por engine.transforms.build_exceptions() + a lista de
+    avisos do RunControls.
+
+    Extraída de main() pra ser testável isoladamente (V2/R9, 2026-07-20) — main()
+    lida com o contrato de inputs/outputs file-like do PPR, o que tornaria difícil
+    testar só a montagem do Excel sem essa separação.
+    """
     import pandas as pd
+
+    cols = ["Código", "Descrição", "Valor"]
+    cols_r9 = ["Codigo Interno", "Tipo", "Conta Contabil", "Nome da Conta", "Conta destino",
+               "Nome conta contábil", "Nome da Classe de Valor", "Valor", "Centro de Custo",
+               "Nome do Centro de Custo", "Motivo", "Conta OM", "Ação Recomendada"]
+    cols_r10 = ["Codigo Interno", "Tipo", "Nome da Classe de Valor", "Valor",
+               "Conta destino original", "Conta destino corrigida", "Conta OM"]
+
+    df_contas = exc.get("contas")
+    df_cc = exc.get("centros_custo")
+    df_bloqueio = exc.get("bloqueio_prefixo")
+    df_correcao = exc.get("correcao_automatica")
+    if df_contas is None:
+        df_contas = pd.DataFrame(columns=cols)
+    if df_cc is None:
+        df_cc = pd.DataFrame(columns=cols)
+    if df_bloqueio is None:
+        df_bloqueio = pd.DataFrame(columns=cols_r9)
+    if df_correcao is None:
+        df_correcao = pd.DataFrame(columns=cols_r10)
+
+    df_avisos = pd.DataFrame(
+        aviso_rows, columns=["etapa", "severidade", "codigo", "mensagem", "registros", "valor"]
+    ).rename(columns={"etapa": "Etapa", "severidade": "Severidade", "codigo": "Código",
+                      "mensagem": "Mensagem", "registros": "Registros", "valor": "Valor"})
+
+    exc_io = io.BytesIO()
+    with pd.ExcelWriter(exc_io, engine="openpyxl") as xw:
+        df_contas.to_excel(xw, sheet_name="Contas Contábeis", index=False)
+        df_cc.to_excel(xw, sheet_name="Centros de Custo", index=False)
+        df_correcao.to_excel(xw, sheet_name="Correção Automática de Conta", index=False)
+        df_bloqueio.to_excel(xw, sheet_name="Bloqueio Prefixo Conta", index=False)
+        df_avisos.to_excel(xw, sheet_name="Avisos", index=False)
+    exc_io.seek(0)
+    return exc_io
+
+
+def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
+         estrutura_contas=None, base_reclassificada=None, estrutura_entidades_cc=None,
+         depara_grupos=None, r9_modo_warning=None):
+    import pandas as pd
+
+    # V2/R10 (decisão dono 2026-07-21) — leitura tolerante: aceita bool True,
+    # ou string "true"/"1"/"sim"/"yes" (case-insensitive); qualquer outra
+    # coisa (None, "false", "0", ausente) vira False (bloqueia, o default).
+    # ⚠️ Pendência: o tipo REAL do campo `r9_modo_warning` no admin do PPR
+    # ainda não foi confirmado com o time de analytics — hoje esta ferramenta
+    # só tem inputs de arquivo, este é o primeiro campo não-arquivo.
+    modo_r9_warning = str(r9_modo_warning).strip().lower() in ("true", "1", "sim", "yes")
 
     # 1) Diretórios limpos por execução
     shutil.rmtree(WORK, ignore_errors=True)
@@ -155,10 +235,21 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
         "depara_custo":         depara_custo,
         "classe_valor_conta":   classe_valor_conta,
         "estrutura_contas":     estrutura_contas,
+        "depara_grupos":        depara_grupos,          # V2/R4
         "estrutura_entidades_cc": estrutura_entidades_cc,
     }
+    gravados = {}
     for role, fobj in incoming.items():
-        _write_input(fobj, os.path.join(IN_DIR, CANON[role]))
+        gravados[role] = _write_input(fobj, os.path.join(IN_DIR, CANON[role]))
+
+    # V2/D1 — validação upfront: obrigatório ausente vira erro acionável AGORA,
+    # não FileNotFoundError críptico no meio do engine.
+    faltando = [nome for role, nome in REQUIRED_INPUTS.items() if not gravados.get(role)]
+    if faltando:
+        raise RuntimeError(
+            "[INPUT_OBRIGATORIO_AUSENTE] Os seguintes inputs obrigatórios não foram "
+            f"enviados (ou vieram vazios): {faltando}. Envie os arquivos e execute novamente."
+        )
 
     # base_reclassificada agora é só o override manual (pula a chamada à API do PPR
     # em reclassifier_bridge quando informado) — lido direto em memória, não escrito
@@ -181,13 +272,23 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
     root.handlers = [handler]
     root.setLevel(logging.INFO)
 
-    # 3) Env apontando para os dirs de trabalho + roda o engine (intacto)
+    # 3) Env apontando para os dirs de trabalho + roda o engine
     os.environ["BBV001_INPUT_DIR"] = IN_DIR
     os.environ["BBV001_OUTPUT_DIR"] = OUT_DIR
     os.environ["BBV001_BASE_FILE"] = CANON["base_fechamento"]
 
     import pipeline
-    result = pipeline.run_pipeline(base_reclassificada_override=df_reclass_override)
+    from controls import BloqueioError
+    try:
+        result = pipeline.run_pipeline(base_reclassificada_override=df_reclass_override,
+                                       modo_r9_warning=modo_r9_warning)
+    except BloqueioError as exc:
+        # V2 — erro de NEGÓCIO com mensagem acionável (input inválido, GRUPO não
+        # cadastrado, duplicação fabricada, conservação violada). Propaga como
+        # RuntimeError: o PPR marca a execução como falha e exibe a mensagem ao
+        # usuário no status — nenhuma base_final é publicada.
+        logging.getLogger(__name__).error(str(exc))
+        raise RuntimeError(str(exc)) from exc
 
     # 4) Auditoria por Tipo (output tipo=tabela → JSON array de linhas)
     audit_rows = []
@@ -215,11 +316,21 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
                 "valor_pos_reclassf": _fmt_valor_br(float(r["Valor pós Reclassf."])),
             })
 
+    # 4c) V2 — avisos estruturados (aba 'Avisos' + tabela `warnings` + resumo no log)
+    controls = result.get("controls")
+    aviso_rows = controls.to_rows() if controls is not None else []
+    resumo = controls.resumo_log() if controls is not None else ""
+
     # 5) Monta os parâmetros de saída
     parametros_saida = {
         "auditoria": json.dumps(audit_rows, ensure_ascii=False),
         "valor_por_pacote": json.dumps(pacote_rows, ensure_ascii=False),
-        "log_execucao": buf.getvalue(),
+        # V2 — tabela de avisos (OutputField `warnings`, opcional cadastrar no PPR;
+        # o mesmo conteúdo SEMPRE sai na aba 'Avisos' do excel de exceções e no
+        # resumo do topo do log, garantindo visibilidade sem mudança de admin)
+        "warnings": json.dumps(aviso_rows, ensure_ascii=False),
+        # V2 — resumo da conciliação + avisos no TOPO do log (o detalhe segue abaixo)
+        "log_execucao": resumo + buf.getvalue(),
         # A etapa de reclassificação sempre roda agora (override manual ou via API a
         # reclassificador_predicao_bbv001, que já tem seus próprios defaults) — "Run 1"
         # sem reclassificação não existe mais.
@@ -234,20 +345,10 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
         parametros_saida["base_reclassificador"] = recl_io
         parametros_saida["base_reclassificador__nome"] = RECL_NAME
 
-    # 6) Excel de exceções (2 abas): Contas Contábeis e Centros de Custo
-    cols = ["Código", "Descrição", "Valor"]
+    # 6) Excel de exceções — V2: 5 abas (Contas Contábeis, Centros de Custo,
+    #    Correção Automática de Conta, Bloqueio Prefixo Conta, Avisos)
     exc = result.get("exceptions", {}) or {}
-    df_contas = exc.get("contas")
-    df_cc = exc.get("centros_custo")
-    if df_contas is None:
-        df_contas = pd.DataFrame(columns=cols)
-    if df_cc is None:
-        df_cc = pd.DataFrame(columns=cols)
-    exc_io = io.BytesIO()
-    with pd.ExcelWriter(exc_io, engine="openpyxl") as xw:
-        df_contas.to_excel(xw, sheet_name="Contas Contábeis", index=False)
-        df_cc.to_excel(xw, sheet_name="Centros de Custo", index=False)
-    exc_io.seek(0)
+    exc_io = _montar_excel_excecoes(exc, aviso_rows)
     parametros_saida["excecoes"] = exc_io
     parametros_saida["excecoes__nome"] = EXCECOES_NAME
 
