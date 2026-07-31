@@ -8,8 +8,20 @@ do Alteryx, para que transforms.py mude o mínimo possível e o diff v1→v2 fiq
                      mensagem, registros afetados, valor afetado)
   - BloqueioError  : erro de negócio com mensagem acionável ao usuário final do PPR
                      (ERRO bloqueante — a execução NÃO produz base_final)
-  - RunControls    : coletor de avisos + censo de duplicatas início×fim (R8) +
-                     termos da equação de conservação (A1)
+  - RunControls    : coletor de avisos + razões por lançamento (V3) + censo de
+                     duplicação por ID Lançamento (R8) + termos da equação de
+                     conservação (A1)
+
+V3 (2026-07-27): o censo deixou de comparar multiplicidade de `Codigo Interno`
+entre início e fim da cascata — como `ID Lançamento` é único por construção na
+base bruta, basta detectar ID repetido na união final. Duplicata NATIVA de
+`Codigo Interno` virou aviso informativo (`censo_duplicata_nativa`).
+
+V3 (2026-07-28): a conservação (A1) deixou de ser a SOMA de 6 termos por etapa e
+passou a ser IDENTIDADE DE CONJUNTO entre a Base de Fechamento e a base final —
+como a base final agora é o universo completo (nada é descartado), a verificação
+certa é "mesmo conjunto de ID Lançamento, mesma soma de Valor". Os termos por
+etapa continuam sendo registrados, mas só alimentam o resumo do log.
 
 Severidades:
   ERRO    — bloqueia a execução (levanta BloqueioError)
@@ -23,6 +35,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import pandas as pd
+
+from config import CATALOGO_RAZOES, STATUS_PRECEDENCIA, STATUS_OK
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +71,9 @@ class RunControls:
     """Estado dos controles de uma execução. Instanciado 1x por run_pipeline()."""
 
     avisos: list = field(default_factory=list)
-    _censo_m0: Optional[pd.Series] = None          # multiplicidade por Codigo Interno pós-T63/pré-T62
     _conservacao: dict = field(default_factory=dict)  # nome do termo -> (nrows, valor)
+    _razoes: dict = field(default_factory=dict)   # V3: ID Lançamento -> [códigos]
+    _acoes: dict = field(default_factory=dict)    # V3: (ID, código) -> texto de ação
 
     # ------------------------------------------------------------------ avisos
     def add(self, etapa: str, severidade: str, codigo: str, mensagem: str,
@@ -83,85 +98,150 @@ class RunControls:
             for a in self.avisos
         ]
 
-    # ------------------------------------------------------- censo R8 (início×fim)
-    def censo_inicial(self, df: pd.DataFrame) -> None:
-        """m0(k): multiplicidade de cada Codigo Interno pós-T63 e ANTES do join T62.
+    # ------------------------------------------------------- razões V3 (por ID)
+    def registra_razao(self, ids, codigo: str, acoes: Optional[dict] = None) -> None:
+        """V3 — marca lançamentos (por 'ID Lançamento') com um código de razão.
 
-        Duplicata NATIVA (m0>1) é válida — existe na base mensal do cliente e é para
-        ela que o Índice ERP sufixa _N. O censo só condena o que os joins FABRICAREM.
+        `ids`   : qualquer iterável de ID Lançamento (Series, list, Index).
+        `codigo`: precisa estar em config.CATALOGO_RAZOES.
+        `acoes` : dict {ID: texto} opcional — ação POR LANÇAMENTO (ex.: R9, que
+                  monta o texto com a Conta OM específica). Sobrepõe o padrão.
+
+        Chamar 2x com o mesmo (ID, código) é idempotente: o código não duplica.
         """
-        self._censo_m0 = df["Codigo Interno"].value_counts()
-        nativas = int((self._censo_m0 > 1).sum())
+        if codigo not in CATALOGO_RAZOES:
+            raise RuntimeError(f"Código de razão '{codigo}' fora do CATALOGO_RAZOES — "
+                               f"bug de implementação (v3).")
+        for i in pd.Series(list(ids)).dropna().tolist():
+            lista = self._razoes.setdefault(int(i), [])
+            if codigo not in lista:
+                lista.append(codigo)
+        if acoes:
+            for i, txt in acoes.items():
+                self._acoes[(int(i), codigo)] = txt
+
+    def marcacao_por_id(self) -> dict:
+        """V3 — ID Lançamento -> (Status, Motivo, Ação Recomendada).
+
+        Status = o mais grave dos códigos da linha, pela ordem de
+        config.STATUS_PRECEDENCIA. Motivo = TODOS os códigos, na ordem de
+        registro, separados por '; '. Ação = os textos correspondentes, na
+        mesma ordem, separados por ' '.
+        """
+        out = {}
+        for id_lanc, codigos in self._razoes.items():
+            status = min(
+                (CATALOGO_RAZOES[c][0] for c in codigos),
+                key=STATUS_PRECEDENCIA.index,
+            )
+            motivo = "; ".join(codigos)
+            acao = " ".join(
+                self._acoes.get((id_lanc, c), CATALOGO_RAZOES[c][1]) for c in codigos
+            )
+            out[id_lanc] = (status, motivo, acao)
+        return out
+
+    def codigos_por_id(self) -> dict:
+        """V3.1 — ID Lançamento -> [códigos], na ordem de registro.
+
+        Acessor público dos códigos CRUS, sem Status nem texto de ação. Existe porque
+        a rede de segurança da reconciliação precisa saber QUAIS códigos a linha
+        carrega (para isentar só os de config.CODIGOS_QUE_REMOVEM_LANCAMENTO) — o
+        `Status` agregado de marcacao_por_id() não distingue razão que remove
+        lançamento de razão informativa.
+
+        Devolve listas novas: mexer no retorno não corrompe o estado interno.
+        """
+        return {id_lanc: list(codigos) for id_lanc, codigos in self._razoes.items()}
+
+    # ---------------------------------------------------------- censo R8 (V3: por ID)
+    def censo_duplicata_nativa(self, df_base: pd.DataFrame) -> None:
+        """V3 — informativo: quantos 'Codigo Interno' já entram duplicados na base
+        do mês. Duplicata nativa é VÁLIDA (dono, 2026-07-08) — é para ela que o
+        Índice ERP sufixa _N. Nunca bloqueia; só dá visibilidade.
+        """
+        vc = df_base["Codigo Interno"].value_counts()
+        nativas = int((vc > 1).sum())
         if nativas > 0:
             self.add("R8/censo", "INFO", "DUPLICATA_NATIVA",
                      f"{nativas:,} Codigo Interno já entram duplicados na base do mês "
                      f"(válido; Índice ERP recebe sufixo _N).", registros=nativas)
 
     def censo_final(self, df_union: pd.DataFrame) -> None:
-        """m1(k) no union final (pré-RecordID). Chave com m1>m0 = duplicação fabricada
-        por join → ERRO bloqueante (decisão do dono 2026-07-08: Valor duplicado não
-        pode chegar ao Matrix). Saídas legítimas (exceção T62, colapso T132) só
-        REDUZEM multiplicidade — nunca aumentam."""
-        if self._censo_m0 is None:
-            raise RuntimeError("censo_final() chamado sem censo_inicial() — bug de orquestração.")
-        m1 = df_union["Codigo Interno"].value_counts()
-        m0 = self._censo_m0.reindex(m1.index).fillna(0)
-        violadas = m1[m1 > m0]
+        """V3 — 'ID Lançamento' é único por construção na base bruta (1..N), então
+        QUALQUER ID que apareça 2x no union é duplicação fabricada por join.
+        Substitui a comparação m1>m0 por Codigo Interno da v2: mais forte (pega
+        também a duplicação do T62, que entrava no m0) e mais simples (não precisa
+        guardar estado entre o início e o fim).
+
+        Duplicação fabricada = ERRO bloqueante (decisão do dono 2026-07-08 mantida
+        na v3: Valor duplicado não pode chegar ao Matrix; o ajuste é no input).
+        """
+        if len(df_union) == 0:
+            return
+        vc = df_union["ID Lançamento"].value_counts()
+        violadas = vc[vc > 1]
         if len(violadas) > 0:
-            extras = int((m1[violadas.index] - m0[violadas.index]).sum())
-            mask = df_union["Codigo Interno"].isin(violadas.index)
+            extras = int((violadas - 1).sum())
+            mask = df_union["ID Lançamento"].isin(violadas.index)
             valor = float(df_union.loc[mask, "Valor"].sum())
             tipos = sorted(df_union.loc[mask, "Tipo"].dropna().unique().tolist())
             exemplos = ", ".join(str(k) for k in list(violadas.index[:10]))
             self.erro(
                 "R8/censo", "DUPLICACAO_FABRICADA",
-                f"{len(violadas):,} lançamento(s) saíram do tratamento MAIS duplicados do que "
-                f"entraram ({extras:,} linha(s) fabricadas por join; R$ {valor:,.2f} envolvidos; "
+                f"{len(violadas):,} lançamento(s) saíram do tratamento duplicados "
+                f"({extras:,} linha(s) fabricadas por join; R$ {valor:,.2f} envolvidos; "
                 f"caminhos: {tipos}). Causa provável: chave duplicada em cadastro "
-                f"(Classe de Valor × Conta / Unico CV / De-Para / Estrutura). Corrija o cadastro "
-                f"e re-execute. Códigos Internos (até 10): {exemplos}",
+                f"(Classe de Valor × Conta / Unico CV / De-Para / Estrutura). Corrija o "
+                f"cadastro e re-execute. ID Lançamento (até 10): {exemplos}",
                 registros=extras, valor=valor)
         self.add("R8/censo", "INFO", "CENSO_OK",
-                 "Censo início×fim OK: nenhuma chave saiu mais duplicada do que entrou.",
-                 registros=len(m1))
+                 "Censo OK: nenhum lançamento saiu duplicado do tratamento.",
+                 registros=len(vc))
 
-    # -------------------------------------------------- conservação A1 (6 termos)
+    # ------------------------------- conservação A1 (V3: identidade de conjunto)
     def registra_termo(self, nome: str, nrows: int, valor: float) -> None:
+        """Termos por etapa — na V3 servem só ao resumo do log (visibilidade de
+        quanto passou por cada caminho). A conservação NÃO é mais a soma deles:
+        ver verifica_conservacao."""
         self._conservacao[nome] = (int(nrows), float(valor))
 
-    def verifica_conservacao(self) -> None:
-        """base bruta = excluídas T63 + exceções T62 + colapso T132 +
-        bloqueio_prefixo_r9 (V2/R9, 2026-07-20) + union final.
+    def verifica_conservacao(self, df_base: pd.DataFrame,
+                             df_completa: pd.DataFrame) -> None:
+        """V3 — a conservação deixa de ser a soma de 6 termos (que dependia de cada
+        stage registrar o seu) e passa a ser IDENTIDADE: a saída tem que ser o mesmo
+        conjunto de lançamentos que entrou, com a mesma soma de Valor.
 
-        Na v2 não existem os termos 'descartadas T88' (GRUPO não cadastrado = ERRO
-        bloqueante, R4) nem 'duplicações de join' (censo R8 bloqueia). Resíduo ≠ 0
-        significa perda/criação NÃO RASTREADA → ERRO (nunca deixar passar em silêncio).
+        Resíduo ≠ 0 aqui é bug do motor, não input sujo → ERRO bloqueante
+        (a base_final não presta).
         """
-        c = self._conservacao
-        obrigatorios = ("base_bruta", "excluidas_t63", "excecoes_t62", "colapso_t132",
-                        "bloqueio_prefixo_r9", "union_final")
-        faltando = [t for t in obrigatorios if t not in c]
-        if faltando:
-            raise RuntimeError(f"Conservação sem os termos {faltando} — bug de orquestração.")
-        res_rows = c["base_bruta"][0] - c["excluidas_t63"][0] - c["excecoes_t62"][0] \
-            - c["colapso_t132"][0] - c["bloqueio_prefixo_r9"][0] - c["union_final"][0]
-        res_valor = c["base_bruta"][1] - c["excluidas_t63"][1] - c["excecoes_t62"][1] \
-            - c["colapso_t132"][1] - c["bloqueio_prefixo_r9"][1] - c["union_final"][1]
-        if res_rows != 0 or abs(res_valor) > TOL_VALOR:
+        ids_in = set(int(i) for i in df_base["ID Lançamento"])
+        ids_out = set(int(i) for i in df_completa["ID Lançamento"])
+        faltando = sorted(ids_in - ids_out)
+        sobrando = sorted(ids_out - ids_in)
+        v_in = float(df_base["Valor"].sum())
+        v_out = float(df_completa["Valor"].sum())
+        dif = v_out - v_in
+
+        if faltando or sobrando or abs(dif) > TOL_VALOR:
             self.erro(
                 "A1/conservacao", "CONSERVACAO_VIOLADA",
-                f"A conciliação entrada×saída não fechou: resíduo de {res_rows:,} linha(s) e "
-                f"R$ {res_valor:,.2f} sem destino rastreado. A base_final NÃO deve ser usada. "
-                f"Termos: " + "; ".join(f"{k}={v[0]:,}/R$ {v[1]:,.2f}" for k, v in c.items()),
-                registros=abs(res_rows), valor=abs(res_valor))
+                f"A base final NÃO é a mesma base que entrou: {len(faltando):,} "
+                f"lançamento(s) faltando, {len(sobrando):,} sobrando, diferença de "
+                f"R$ {dif:,.2f} no Valor. A base_final NÃO deve ser usada. "
+                f"IDs faltando (até 10): {faltando[:10]} · sobrando (até 10): "
+                f"{sobrando[:10]}",
+                registros=len(faltando) + len(sobrando), valor=abs(dif))
+
         self.add("A1/conservacao", "INFO", "CONSERVACAO_OK",
-                 "Conciliação entrada×saída fechada (resíduo 0 linhas; "
-                 f"R$ {res_valor:,.2f}).", registros=c["union_final"][0], valor=c["union_final"][1])
+                 f"Base final é o universo completo: {len(ids_out):,} lançamentos, "
+                 f"R$ {v_out:,.2f} — idêntico à Base de Fechamento.",
+                 registros=len(ids_out), valor=v_out)
 
     # ------------------------------------------------------------------ resumo
     def resumo_log(self) -> str:
         """Bloco de resumo que o main() põe no TOPO do log_execucao."""
-        linhas = ["=" * 70, "RESUMO DA EXECUÇÃO (v2) — conciliação e avisos", "=" * 70]
+        linhas = ["=" * 70, "RESUMO DA EXECUÇÃO (v3) — conciliação e avisos", "=" * 70]
         if self._conservacao:
             for nome, (n, v) in self._conservacao.items():
                 linhas.append(f"  {nome:<16} {n:>10,} linhas   R$ {v:>18,.2f}")

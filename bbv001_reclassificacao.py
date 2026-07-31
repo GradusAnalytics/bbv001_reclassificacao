@@ -16,12 +16,11 @@ Inputs  (InputField.code): base_fechamento, depara_custo, classe_valor_conta,
                            usa seus próprios arquivos default de modelo/parâmetros — não são
                            mais inputs desta ferramenta. base_reclassificada (opcional) é só
                            um override manual: se informado, pula a chamada à API e usa o
-                           arquivo fornecido diretamente. r9_modo_warning (opcional, V2/R10 —
-                           default bloqueia; pendência de tipo de campo no PPR, ver comentário
-                           em main()) alterna o R9 (bloqueio de cruzamento de prefixo) pro
-                           modo warning (sinaliza, não exclui do base_final).
+                           arquivo fornecido diretamente.
 Outputs (OutputField.code): base_final (arquivo), base_reclassificador (arquivo),
-                            auditoria (tabela), valor_por_pacote (tabela),
+                            auditoria (tabela), auditoria_status (tabela — V3, PENDENTE
+                            cadastro de OutputField no admin do PPR, ver main()),
+                            valor_por_pacote (tabela),
                             warnings (tabela — V2, opcional cadastrar),
                             log_execucao (texto_longo), excecoes (arquivo, 5 abas na V2).
 
@@ -212,18 +211,36 @@ def _montar_excel_excecoes(exc: dict, aviso_rows: list) -> io.BytesIO:
     return exc_io
 
 
+def _monta_auditoria(base_completa):
+    """V3 — auditoria sobre o UNIVERSO COMPLETO: por Tipo (com 'Não classificado')
+    e por Status. Conta 'ID Lançamento', a chave verdadeira do lançamento.
+    """
+    por_tipo, por_status = [], []
+    if base_completa is None or len(base_completa) == 0:
+        return por_tipo, por_status
+    g = (base_completa.groupby("Tipo")
+                      .agg(registros=("ID Lançamento", "count"),
+                           soma_valor=("Valor", "sum"))
+                      .reset_index())
+    for _, r in g.iterrows():
+        por_tipo.append({"tipo": str(r["Tipo"]),
+                         "registros": int(r["registros"]),
+                         "soma_valor": _fmt_valor_br(float(r["soma_valor"]))})
+    s = (base_completa.groupby("Status")
+                      .agg(registros=("ID Lançamento", "count"),
+                           soma_valor=("Valor", "sum"))
+                      .reset_index())
+    for _, r in s.iterrows():
+        por_status.append({"status": str(r["Status"]),
+                           "registros": int(r["registros"]),
+                           "soma_valor": _fmt_valor_br(float(r["soma_valor"]))})
+    return por_tipo, por_status
+
+
 def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
          estrutura_contas=None, base_reclassificada=None, estrutura_entidades_cc=None,
-         depara_grupos=None, r9_modo_warning=None):
+         depara_grupos=None):
     import pandas as pd
-
-    # V2/R10 (decisão dono 2026-07-21) — leitura tolerante: aceita bool True,
-    # ou string "true"/"1"/"sim"/"yes" (case-insensitive); qualquer outra
-    # coisa (None, "false", "0", ausente) vira False (bloqueia, o default).
-    # ⚠️ Pendência: o tipo REAL do campo `r9_modo_warning` no admin do PPR
-    # ainda não foi confirmado com o time de analytics — hoje esta ferramenta
-    # só tem inputs de arquivo, este é o primeiro campo não-arquivo.
-    modo_r9_warning = str(r9_modo_warning).strip().lower() in ("true", "1", "sim", "yes")
 
     # 1) Diretórios limpos por execução
     shutil.rmtree(WORK, ignore_errors=True)
@@ -280,8 +297,7 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
     import pipeline
     from controls import BloqueioError
     try:
-        result = pipeline.run_pipeline(base_reclassificada_override=df_reclass_override,
-                                       modo_r9_warning=modo_r9_warning)
+        result = pipeline.run_pipeline(base_reclassificada_override=df_reclass_override)
     except BloqueioError as exc:
         # V2 — erro de NEGÓCIO com mensagem acionável (input inválido, GRUPO não
         # cadastrado, duplicação fabricada, conservação violada). Propaga como
@@ -290,20 +306,8 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
         logging.getLogger(__name__).error(str(exc))
         raise RuntimeError(str(exc)) from exc
 
-    # 4) Auditoria por Tipo (output tipo=tabela → JSON array de linhas)
-    audit_rows = []
-    unioned = result.get("_intermediates", {}).get("unioned")
-    if unioned is not None and "Tipo" in unioned.columns:
-        g = (unioned.groupby("Tipo")
-                    .agg(registros=("Codigo Interno", "count"),
-                         soma_valor=("Valor", "sum"))
-                    .reset_index())
-        for _, r in g.iterrows():
-            audit_rows.append({
-                "tipo": str(r["Tipo"]),
-                "registros": int(r["registros"]),
-                "soma_valor": _fmt_valor_br(float(r["soma_valor"])),
-            })
+    # 4) Auditoria — V3: sobre a base completa, por Tipo e por Status
+    audit_rows, audit_status_rows = _monta_auditoria(result.get("base_completa"))
 
     # 4b) Valor por Pacote, antes × depois da reclassificação (output tipo=tabela)
     pacote_rows = []
@@ -324,6 +328,13 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
     # 5) Monta os parâmetros de saída
     parametros_saida = {
         "auditoria": json.dumps(audit_rows, ensure_ascii=False),
+        # V3 — quebra por Status (FORA_DE_ESCOPO/FALHA_INTERNA/CADASTRO_PENDENTE/
+        # DESTINO_SUSPEITO/DADO_INVALIDO/OK — ordem de precedência, config.STATUS_
+        # PRECEDENCIA) do mesmo universo completo acima. PENDENCIA: este OutputField
+        # ainda não existe no admin do PPR — precisa ser cadastrado pelo time de
+        # analytics antes desta chave ter efeito na plataforma (mesma natureza da
+        # pendência que `depara_grupos` teve no R4 e o campo de modo do R9 teve no R10).
+        "auditoria_status": json.dumps(audit_status_rows, ensure_ascii=False),
         "valor_por_pacote": json.dumps(pacote_rows, ensure_ascii=False),
         # V2 — tabela de avisos (OutputField `warnings`, opcional cadastrar no PPR;
         # o mesmo conteúdo SEMPRE sai na aba 'Avisos' do excel de exceções e no

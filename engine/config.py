@@ -63,7 +63,12 @@ INPUT_FILES = {
         # mantidos abaixo apenas como seed do template). Manutenção do de-para vira
         # upload de cadastro, não deploy de código. 1 aba, header na linha 1.
         "path": INPUT_DIR / "depara_grupos.xlsx",
-        "sheet": 0,
+        # V3.1 (2026-07-29) — lê por NOME, com fallback para a 1ª aba. Ler por posição
+        # impedia o layout de um arquivo único com todos os cadastros em abas (a
+        # posição 0 seria a aba de outro input). O fallback preserva os arquivos de
+        # depara_grupos já em uso, cuja aba pode ter qualquer nome.
+        "sheet": os.environ.get("BBV001_DEPARA_GRUPOS_SHEET", "De-Para Grupos"),
+        "sheet_fallback": 0,
     },
 }
 
@@ -135,6 +140,18 @@ MANUAL_GROUP_OVERRIDES = [
     {"Grupo": "RESSARCIMENTO",        "Conta OM": "Emolumentos e Custas de Ações de Cobrança", "Conta Contábil": "7193000000001000003000000"},
 ]
 
+# V2/R9-R10 (dono 2026-07-20/21) — família de prefixo de Conta Contábil, usada para
+# decidir se a Conta destino de um lançamento "cruzou" a família da Conta Contábil
+# de origem. 817 e 819 são a MESMA família (podem cruzar entre si sem violação);
+# 818 é família separada (não pode cruzar com 817/819); o 1º dígito 8 separa a
+# família maior (8 cruzando com não-8 também é violação, exceto quando já pega
+# pelo caso 817/818/819). ÚNICA FONTE da regra — antes da refatoração de v3.1
+# (2026-07-30) este dicionário estava copiado literalmente em duas funções de
+# transforms.py (autocorrigir_conta_om/R10 e marcar_bloqueio_prefixo/R9), com
+# risco de as duas discordarem em silêncio se alguém mudasse uma cópia e
+# esquecesse a outra. Consumido por transforms.mascaras_cruzamento_familia().
+FAMILIA_PREFIXO_CONTA = {"817": "817/819", "819": "817/819", "818": "818"}
+
 # --- Output schema for Tool 123 (reclassifier input base) ----------------
 # Columns kept in Tool 122 Select (after dropping the listed ones)
 RECLASSIFIER_OUTPUT_SCHEMA = [
@@ -175,4 +192,114 @@ FINAL_OUTPUT_SCHEMA = [
     "Fornecedor",
     "Conta Contabil",
     "Nome da Conta",
+    # V3 (2026-07-27) — 4 colunas novas, SEMPRE no fim para não mover as 15 originais
+    # de posição (a carga do Matrix depende da ordem). Racional:
+    # docs/superpowers/specs/2026-07-27-v3-base-final-completa-design.md §5.
+    "ID Lançamento",
+    "Status",
+    "Motivo",
+    "Ação Recomendada",
 ]
+
+# =========================================================================
+# V3 (2026-07-27) — catálogo de razões da coluna Status/Motivo/Ação Recomendada
+# Spec: docs/superpowers/specs/2026-07-27-v3-base-final-completa-design.md §5
+# =========================================================================
+STATUS_OK = "OK"
+STATUS_CADASTRO_PENDENTE = "CADASTRO_PENDENTE"
+STATUS_DESTINO_SUSPEITO = "DESTINO_SUSPEITO"
+STATUS_DADO_INVALIDO = "DADO_INVALIDO"
+STATUS_FORA_DE_ESCOPO = "FORA_DE_ESCOPO"
+# V3.1 (2026-07-29) — defeito do MOTOR, não do input: o lançamento sumiu da cascata
+# sem que nenhuma etapa assumisse a autoria. Volta à base com a conta de origem para
+# que o valor se conserve e o mês possa ser carregado, marcado para auditoria nossa.
+STATUS_FALHA_INTERNA = "FALHA_INTERNA"
+
+# Do mais grave ao menos grave. FORA_DE_ESCOPO continua em 1º porque é ele que define
+# a ABA da saída (o split de build_final_consolidated compara com ele) — trocar essa
+# posição mudaria em silêncio para qual aba a linha vai. FALHA_INTERNA vem logo depois,
+# vencendo todos os demais.
+STATUS_PRECEDENCIA = [
+    STATUS_FORA_DE_ESCOPO,
+    STATUS_FALHA_INTERNA,
+    STATUS_CADASTRO_PENDENTE,
+    STATUS_DESTINO_SUSPEITO,
+    STATUS_DADO_INVALIDO,
+    STATUS_OK,
+]
+
+# V3.1 — os ÚNICOS códigos cuja presença EXPLICA um lançamento ter saído da cascata.
+# Todas as outras razões do catálogo são informativas: são registradas em linhas que
+# SEGUEM no fluxo. Por isso a rede de segurança da reconciliação só pode isentar estes
+# três — isentar qualquer `Status != OK` deixava ~10 mil lançamentos fora da rede
+# (achado da revisão final da v3, 2026-07-29).
+CODIGOS_QUE_REMOVEM_LANCAMENTO = frozenset({
+    "CV_EXCLUIDA",            # T63 — filtro de Classe de Valor excluída
+    "CONTA_NAO_CADASTRADA",   # T62 — conta sem match na Estrutura de Contas
+    "GRUPO_NAO_CADASTRADO",   # T88 — GRUPO de Cobrança sem cadastro
+})
+
+# código → (Status, Ação Recomendada padrão).
+# Códigos de prefixo (R9) têm ação POR LANÇAMENTO gerada em marcar_bloqueio_prefixo;
+# o texto aqui é o fallback caso a ação específica não venha.
+CATALOGO_RAZOES = {
+    "CV_EXCLUIDA": (
+        STATUS_FORA_DE_ESCOPO,
+        "Classe de Valor excluída do escopo por configuração; nenhuma ação necessária."),
+    "CONTA_NAO_CADASTRADA": (
+        STATUS_CADASTRO_PENDENTE,
+        "Cadastre esta Conta Contábil na Estrutura de Contas e re-execute — sem isso o "
+        "lançamento fica sem Pacote no Matrix."),
+    "GRUPO_NAO_CADASTRADO": (
+        STATUS_CADASTRO_PENDENTE,
+        "Cadastre o GRUPO de Cobrança no de-para de grupos (colunas Grupo · Conta OM · "
+        "Conta Contábil) e re-execute."),
+    "CC_NAO_CADASTRADO": (
+        STATUS_CADASTRO_PENDENTE,
+        "Cadastre o Centro de Custo na Estrutura de Entidades×CC (não afeta a "
+        "classificação deste lançamento)."),
+    "CLASSE_NAO_CADASTRADA": (
+        STATUS_CADASTRO_PENDENTE,
+        "Cadastre a Classe de Valor nas abas Base e Unico CV do Classe×Conta."),
+    "CLASSE_RENOMEADA": (
+        STATUS_CADASTRO_PENDENTE,
+        "O nome da Classe de Valor na base não bate com o cadastrado para esse código — "
+        "alinhe o cadastro Classe×Conta com a base."),
+    "CLASSE_SEM_UNICO_CV": (
+        STATUS_CADASTRO_PENDENTE,
+        "Cadastre a Classe de Valor na aba Unico CV do Classe×Conta."),
+    "PREFIXO_818_CRUZADO": (
+        STATUS_DESTINO_SUSPEITO,
+        "A Conta destino cruza a família de prefixo 818↔817/819 da conta de origem — "
+        "cadastre uma conta da família correta na Conta OM."),
+    "PREFIXO_FAMILIA_8_CRUZADO": (
+        STATUS_DESTINO_SUSPEITO,
+        "A Conta destino cruza a família de prefixo 8↔não-8 da conta de origem — "
+        "cadastre uma conta da família correta na Conta OM."),
+    "RECLASSIFICADOR_FALLBACK": (
+        STATUS_DESTINO_SUSPEITO,
+        "O Reclassificador não cobriu este lançamento — manteve a conta de origem como "
+        "destino. Revise se a conta está correta."),
+    "DEPARA_CONFLITO_RESOLVIDO_POR_VALOR": (
+        STATUS_DESTINO_SUSPEITO,
+        "O De-Para tinha regras divergentes na mesma competência — aplicada a de maior "
+        "SOMA(|Valor|). Revise o cadastro."),
+    "DEPARA_CONFLITO_MESMA_COMPETENCIA": (
+        STATUS_DESTINO_SUSPEITO,
+        "O De-Para tem regras divergentes com empate de valor na mesma competência — "
+        "aplicada a primeira em ordem de leitura. Corrija o cadastro."),
+    "MES_INVALIDO": (
+        STATUS_DADO_INVALIDO,
+        "A coluna 'Mes' deste lançamento não é uma data válida — o Matrix receberá a "
+        "linha sem competência. Corrija a Base de Fechamento."),
+    "PREFIXO_CORRIGIDO_AUTOMATICAMENTE": (
+        STATUS_OK,
+        "A Conta destino foi corrigida automaticamente para uma conta compatível na "
+        "mesma Conta OM — nenhuma ação necessária."),
+    "PERDA_NAO_EXPLICADA": (
+        STATUS_FALHA_INTERNA,
+        "Este lançamento sumiu do tratamento sem que nenhuma etapa registrasse o "
+        "motivo — é defeito da própria ferramenta, não do arquivo enviado. Ele voltou "
+        "à base com a conta de origem para que o valor não se perca. NÃO carregue esta "
+        "linha e avise o time responsável pela ferramenta, informando o ID Lançamento."),
+}

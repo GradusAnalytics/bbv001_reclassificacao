@@ -7,16 +7,25 @@ Saída: aux_files/depara_grupos_seed.xlsx (Grupo · Conta OM · Conta Contábil)
 
 Este arquivo é o ponto de partida do cadastro que o usuário mantém — novos GRUPOs
 (ex.: REEMBOLSO, que em Abr26 tinha 309 lançamentos sem cadastro) são adicionados
-pelo próprio usuário, sem deploy de código."""
+pelo próprio usuário, sem deploy de código.
+
+V3.1 (2026-07-30): a aba do arquivo gravado tem de se chamar exatamente o que
+`read_depara_grupos` espera (`INPUT_FILES["depara_grupos"]["sheet"]`, default
+`De-Para Grupos`) — lido daqui, nunca hardcoded, para template e leitor não
+poderem divergir. Sem isso, no layout de ARQUIVO ÚNICO (todos os cadastros em
+abas do mesmo arquivo) a aba 0 pertenceria a outro cadastro e o fallback do
+leitor cairia na aba errada; no arquivo isolado o fallback mascarava o problema
+(achado da revisão final da v3.1)."""
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "engine"))
 
 import pandas as pd  # noqa: E402
-from config import MANUAL_GROUP_OVERRIDES  # noqa: E402
+from config import INPUT_FILES, MANUAL_GROUP_OVERRIDES  # noqa: E402
 
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "depara_grupos_seed.xlsx")
+aba = INPUT_FILES["depara_grupos"]["sheet"]
 df = pd.DataFrame(MANUAL_GROUP_OVERRIDES)[["Grupo", "Conta OM", "Conta Contábil"]]
-df.to_excel(out, index=False)
-print(f"seed gravado: {out} ({len(df)} grupos)")
+df.to_excel(out, sheet_name=aba, index=False)
+print(f"seed gravado: {out} ({len(df)} grupos, aba {aba!r})")

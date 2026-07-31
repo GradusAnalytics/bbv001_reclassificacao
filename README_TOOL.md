@@ -1,3 +1,19 @@
+> ⚠️ **Nota (2026-07-30, revisão final v3.1).** Este documento descreve o **deploy/
+> infra** herdado da v1 (repo, ECS, workflow, bridge da API) e ainda vale para isso.
+> Mas os **contratos de Input/Output** listados abaixo estão **desatualizados** —
+> os vigentes são o `README_V3.md` e o `SCHEMA_OUTPUT.md` desta mesma pasta.
+> Pontos em que o texto abaixo diverge do que a ferramenta faz hoje:
+> 1. **Excel de exceções** — a tabela de OutputFields abaixo descreve **2** abas
+>    (Contas Contábeis · Centros de Custo); desde a v2 são **5** (+ Correção
+>    Automática de Conta, Bloqueio Prefixo Conta, Avisos).
+> 2. **InputFields** — a lista abaixo não tem `depara_grupos`, que é **obrigatório**
+>    desde a v2 (de-para GRUPO → Conta OM/Conta Contábil).
+> 3. **OutputFields** — a lista abaixo não tem `warnings` (tabela de avisos, v2) nem
+>    `auditoria_status` (quebra por Status, v3).
+>
+> Quem cair neste arquivo primeiro: não o leia como contrato vigente de
+> Input/Output — confira o `README_V3.md`.
+
 # BBV001 — Ferramenta tradicional do PPR
 
 Implementada no padrão do template `analytics-standard-template` (dummy_repo):

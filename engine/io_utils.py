@@ -112,6 +112,22 @@ def read_base_fechamento() -> pd.DataFrame:
     cfg = INPUT_FILES["base_fechamento"]
     df = _read_excel(cfg["path"], sheet_name=cfg["sheet"])
     df = df.rename(columns={"Valor do Lancamento": "Valor"})
+    # V2/D1 — validar ANTES de tocar qualquer coluna. A ordem importa: a coerção de
+    # 'Conta Contabil' logo abaixo indexa a coluna pelo nome, então se o usuário
+    # enviar o arquivo/aba errado (cenário mais provável na virada de mês) ele
+    # receberia `KeyError: 'Conta Contabil'` cru do pandas em vez do erro de negócio
+    # acionável que o D1 promete (qual input, qual aba, quais colunas faltam).
+    # Foi assim que se descobriu que 'real junho bv.xlsx' não era base de fechamento
+    # (Task 13, achado A1/A2). Vem depois do rename porque REQUIRED_COLUMNS exige
+    # 'Valor', o nome já renomeado. Regressão coberta por
+    # tests/test_v3_colunas_faltando_antes_da_coercao.py.
+    _valida_colunas(df, "base_fechamento", cfg["path"], cfg["sheet"])
+    # V3 — ID Lançamento: posição da linha na base bruta (1..N), imutável.
+    # É a ÚNICA chave verdadeira por lançamento: "Codigo Interno" não serve porque
+    # duplicata nativa existe e é válida (dono, 2026-07-08; MAPA_PROCESSO G9).
+    # Nome deliberadamente diferente de "RecordID", que já existe no Tool 110
+    # significando outra coisa (cumcount por Codigo Interno).
+    df.insert(0, "ID Lançamento", range(1, len(df) + 1))
     # Conta Contabil cells come back as full-precision Python ints (25-digit account codes
     # stored as numbers in Excel). Keep them as strings: as ints they survive the pipeline
     # in memory but get cast to float64 on the Excel write, losing precision
@@ -120,7 +136,6 @@ def read_base_fechamento() -> pd.DataFrame:
     df["Conta Contabil"] = df["Conta Contabil"].apply(
         lambda v: v if (isinstance(v, str) or (isinstance(v, float) and pd.isna(v))) else str(v)
     )
-    _valida_colunas(df, "base_fechamento", cfg["path"], cfg["sheet"])  # V2/D1
     log_step(logger, "4", "Read Base Fechamento + rename Valor", df)
     return df
 
@@ -163,9 +178,15 @@ def read_estrutura_contas() -> pd.DataFrame:
 
 def read_depara_grupos() -> pd.DataFrame:
     """V2/R4 (NOVO) — de-para GRUPO → Conta OM / Conta Contábil. Input OBRIGATÓRIO;
-    substitui os 11 overrides hardcoded do Tool 86. Template: 1 aba, header na
-    linha 1, colunas Grupo · Conta OM · Conta Contábil (seed em
-    aux_files/gera_seed_depara_grupos.py)."""
+    substitui os 11 overrides hardcoded do Tool 86. Template: header na linha 1,
+    colunas Grupo · Conta OM · Conta Contábil (seed em
+    aux_files/gera_seed_depara_grupos.py).
+
+    V3.1 (2026-07-30): a aba é lida por NOME (`INPUT_FILES[...]["sheet"]`, default
+    `De-Para Grupos`), com fallback para a primeira aba do arquivo. Deixou de ser
+    "1 aba": o arquivo pode trazer todos os cadastros, um por aba, e o mesmo arquivo
+    ser enviado em todos os campos — só a Base de Fechamento continua separada
+    (ela e a aba `Base` do classe_valor_conta exigiriam o mesmo nome de aba)."""
     cfg = INPUT_FILES["depara_grupos"]
     path: Path = cfg["path"]
     if not path.exists():
@@ -174,8 +195,33 @@ def read_depara_grupos() -> pd.DataFrame:
             "O input 'depara_grupos' (De-Para de Grupos de Cobrança → Conta) é obrigatório "
             "e não foi enviado. Use o template de 3 colunas (Grupo · Conta OM · Conta "
             "Contábil) — sem ele não é possível classificar o caminho Cobrança.")
-    df = _read_excel(path, sheet_name=cfg["sheet"])
-    _valida_colunas(df, "depara_grupos", path, cfg["sheet"])  # V2/D1
+    # V3.1 — aba por nome, caindo para a 1ª aba quando o nome não existe no arquivo
+    aba_esperada = cfg["sheet"]
+    aba = aba_esperada
+    fallback_usado = False
+    try:
+        df = _read_excel(path, sheet_name=aba)
+    except ValueError:
+        fallback_usado = True
+        aba = cfg.get("sheet_fallback", 0)
+        df = _read_excel(path, sheet_name=aba)
+        logger.info(
+            f"[R4] Aba {aba_esperada!r} não existe em '{path.name}' — lendo a primeira "
+            f"aba do arquivo. Nomear a aba permite enviar todos os cadastros num "
+            f"arquivo só.")
+    # V3.1 (revisão final) — se a validação de colunas falhar DEPOIS do fallback, o
+    # `logger.info` acima nunca chega ao usuário: um BloqueioError aborta o main()
+    # antes de montar o log de execução (`bbv001_reclassificacao.py`). Por isso o
+    # rótulo de aba passado à validação, sozinho, tem de dizer que houve fallback,
+    # qual era a aba esperada e que ela não foi encontrada — sem isso a mensagem
+    # citava só a aba efetivamente lida ("aba '0'"), que não diz nada ao usuário.
+    aba_label = aba
+    if fallback_usado:
+        aba_label = (
+            f"{aba} (a ferramenta tentou a 1ª aba do arquivo porque a aba esperada "
+            f"{aba_esperada!r} não foi encontrada)"
+        )
+    _valida_colunas(df, "depara_grupos", path, aba_label)  # V2/D1
     # Cadastro mantido pelo usuário: strip nas 3 colunas de texto (contrato do
     # template — evita não-match por espaço acidental; não afeta a paridade dos
     # joins portados do Alteryx, que seguem byte-a-byte).
@@ -274,11 +320,17 @@ def write_reclassifier_base(df: pd.DataFrame) -> Path:
     return OUTPUT_RECLASSIFIER
 
 
-def write_final_consolidated(df: pd.DataFrame) -> Path:
-    """Tool 114 equivalent — the consolidated base for matrix upload.
-    (Alteryx workflow did not write this; we add it because user confirmed it's needed.)
+def write_final_consolidated(df_aba1: pd.DataFrame, df_aba2: pd.DataFrame) -> Path:
+    """Tool 114 equivalent — base consolidada para carga no Matrix.
+
+    V3 (2026-07-27): 2 abas no mesmo schema — 'Consolidado' (universo gerencial,
+    sem as Classes de Valor excluídas) e 'Fora de Escopo' (só elas). O nome da
+    aba 1 é o mesmo da v2 para não quebrar quem já consome o arquivo.
     """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_excel(OUTPUT_FINAL_CONSOLIDATED, sheet_name="Consolidado", index=False)
-    log_step(logger, "114", f"Wrote final consolidated → {OUTPUT_FINAL_CONSOLIDATED.name}", df)
+    with pd.ExcelWriter(OUTPUT_FINAL_CONSOLIDATED, engine="openpyxl") as xw:
+        df_aba1.to_excel(xw, sheet_name="Consolidado", index=False)
+        df_aba2.to_excel(xw, sheet_name="Fora de Escopo", index=False)
+    log_step(logger, "114", f"Wrote final consolidated → {OUTPUT_FINAL_CONSOLIDATED.name} "
+                            f"(2 abas: {len(df_aba1):,} + {len(df_aba2):,})", df_aba1)
     return OUTPUT_FINAL_CONSOLIDATED
