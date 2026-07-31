@@ -24,11 +24,14 @@ import logging
 import time
 import uuid
 
-import boto3
 import pandas as pd
-import requests
 
 import config as cfg
+
+# V2: boto3/requests são importados DENTRO das funções que os usam (lazy) — a bridge
+# só roda quando NÃO há override de base_reclassificada, então execuções offline
+# (regressão/QA, sempre com override ou mock) não exigem as dependências AWS.
+# Em produção nada muda: os pacotes estão na imagem (requirements.txt).
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,7 @@ def build_predicao_base(df_for_reclass: pd.DataFrame) -> io.BytesIO:
 
 
 def _s3_client():
+    import boto3  # lazy — ver nota no topo do módulo
     return boto3.client(
         "s3",
         aws_access_key_id=cfg.AWS_ACCESS_KEY_ID,
@@ -84,6 +88,7 @@ def _upload_bytes(data: bytes, key: str) -> str:
 
 
 def _post_exec(files: dict) -> str:
+    import requests  # lazy — ver nota no topo do módulo
     url = f"{cfg.PPR_API_BASE_URL.rstrip('/')}/ferramentas/api/exec/"
     payload = {
         "auth_token": cfg.PPR_API_TOKEN,
@@ -106,6 +111,7 @@ def _post_exec(files: dict) -> str:
 
 
 def _poll_status(execution_id: str) -> dict:
+    import requests  # lazy — ver nota no topo do módulo
     url = f"{cfg.PPR_API_BASE_URL.rstrip('/')}/ferramentas/api/exec/{execution_id}/"
     deadline = time.monotonic() + cfg.RECLASSIFIER_BRIDGE_TIMEOUT_S
     while True:
@@ -135,6 +141,7 @@ def _poll_status(execution_id: str) -> dict:
 
 
 def _download_output(status_body: dict, code: str = "output") -> pd.DataFrame:
+    import requests  # lazy — ver nota no topo do módulo
     outputs = status_body.get("outputs") or []
     output = next((o for o in outputs if o.get("code") == code), None)
     if output is None or not output.get("arquivo"):

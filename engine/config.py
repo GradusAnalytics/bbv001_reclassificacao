@@ -58,6 +58,31 @@ INPUT_FILES = {
         "path": INPUT_DIR / "estrutura_entidades_cc.xlsx",
         "sheet": "Estrutura completa de Entidades",
     },
+    "depara_grupos": {                      # V2/R4 — de-para GRUPO → Conta (OBRIGATÓRIO)
+        # Substitui os 11 overrides hardcoded do Tool 86 (MANUAL_GROUP_OVERRIDES,
+        # mantidos abaixo apenas como seed do template). Manutenção do de-para vira
+        # upload de cadastro, não deploy de código. 1 aba, header na linha 1.
+        "path": INPUT_DIR / "depara_grupos.xlsx",
+        "sheet": 0,
+    },
+}
+
+# --- V2 — colunas mínimas por input (validação pós-leitura; SPEC_V2 §3.10/D1) ------
+# Falta de coluna → BloqueioError com mensagem acionável (qual arquivo, qual aba,
+# quais colunas), em vez de KeyError críptico no meio da cascata.
+REQUIRED_COLUMNS = {
+    "base_fechamento": [
+        "Codigo Interno", "Valor",  # "Valor do Lancamento" já renomeada na leitura
+        "Conta Contabil", "Nome da Conta", "Nome da Classe de Valor", "Classe de Valor",
+        "Grupo Acionista", "Grupo Conta", "Historico", "Fornecedor", "Mes",
+        "Centro de Custo", "Nome do Centro de Custo",
+    ],
+    "depara_custo": ["HISTORICO_2", "FORNECEDOR", "FINALIZACAO", "GRUPO", "DATA_BASE",
+                     "VALOR_LANCAMENTO"],
+    "classe_valor_conta_base": ["Nome classe de valor", "Cód conta contábil", "Número att"],
+    "classe_valor_conta_unico_cv": ["Classe de valor", "Como tratar?", "Código conta contábil"],
+    "estrutura_contas": ["CONTA CONTÁBIL", "CONTA", "PACOTE"],
+    "depara_grupos": ["Grupo", "Conta OM", "Conta Contábil"],
 }
 
 # --- Cadastros para o relatório de exceções (Tool 200) -------------------
@@ -93,6 +118,9 @@ SPECIAL_TREATMENT_VALUES = ["Utilizar Reclassificador", "Consultoria"]
 DEPARA_MIN_DATE = "2026-01-01"  # unused — see note above
 
 # Tool 86 — manual Grupo → Conta OM / Conta Contábil overrides (TextInput hardcoded in Alteryx)
+# V2/R4: NÃO é mais consumido pelo pipeline — o de-para vem do input obrigatório
+# `depara_grupos` (INPUT_FILES acima). Mantido SOMENTE como seed do template do cadastro
+# (aux_files/gera_seed_depara_grupos.py) e referência histórica da paridade Alteryx.
 MANUAL_GROUP_OVERRIDES = [
     {"Grupo": "REMUNERACAO",          "Conta OM": "Assessorias de Cobrança",            "Conta Contábil": "8199900000012000001000000"},
     {"Grupo": "AJUIZAMENTO",          "Conta OM": "Emolumentos e Custas de Ações de Cobrança", "Conta Contábil": "8179900000000000011000000"},
