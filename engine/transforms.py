@@ -28,6 +28,7 @@ from config import (
     FINAL_OUTPUT_SCHEMA,
     STATUS_OK,
     STATUS_FORA_DE_ESCOPO,
+    STATUS_CADASTRO_BLOQUEANTE,
     CODIGOS_QUE_REMOVEM_LANCAMENTO,
     FAMILIA_PREFIXO_CONTA,
 )
@@ -61,7 +62,7 @@ def preprocess_base(df_base: pd.DataFrame, df_estrutura: pd.DataFrame,
       j_out — base enriquecida (Conta GCUT / Pacote GCUT), segue para a cascata.
       l_out — contas da base SEM match na Estrutura; não seguem a cascata, mas
               voltam ao base_final (via reconciliar_espinha) com Status
-              'CADASTRO_PENDENTE' e a própria conta de origem como destino.
+              'CADASTRO_BLOQUEANTE' e a própria conta de origem como destino.
       df    — base pós-T63 (universo canônico das exceções — R6).
     """
     # Tool 63 — filter excluded value classes
@@ -107,7 +108,7 @@ def preprocess_base(df_base: pd.DataFrame, df_estrutura: pd.DataFrame,
         controls.add("T62/Estrutura", "WARNING", "CONTA_NAO_CADASTRADA",
                      f"{l_out['Conta Contabil'].nunique()} conta(s) contábil(is) da base não "
                      f"existem na Estrutura de Contas — os lançamentos entram na base final "
-                     f"com Status 'CADASTRO_PENDENTE' e a própria conta de origem como "
+                     f"com Status 'CADASTRO_BLOQUEANTE' e a própria conta de origem como "
                      f"destino (ficam sem Pacote no Matrix até o cadastro ser feito).",
                      registros=len(l_out), valor=float(l_out["Valor"].sum()))
         # V3 — razão por lançamento (volta ao base_final com Conta destino = origem, D3)
@@ -116,7 +117,7 @@ def preprocess_base(df_base: pd.DataFrame, df_estrutura: pd.DataFrame,
         logger.warning(
             f"[Tool 62] {len(l_out)} rows in base have no match in Estrutura de Contas — "
             f"they skip the cascade (V3: they still return to base_final via "
-            f"reconciliar_espinha, marked CADASTRO_PENDENTE). Unique Contas: "
+            f"reconciliar_espinha, marked CADASTRO_BLOQUEANTE). Unique Contas: "
             f"{l_out['Conta Contabil'].nunique()}"
         )
 
@@ -543,7 +544,7 @@ def apply_manual_group_override(
 
     V3 (2026-07-27) — GRUPO sem cadastro deixou de ser ERRO BLOQUEANTE: vira razão
     `GRUPO_NAO_CADASTRADO` por ID Lançamento (WARNING) e o lançamento volta ao
-    base_final via `reconciliar_espinha` (Status CADASTRO_PENDENTE, Conta destino =
+    base_final via `reconciliar_espinha` (Status CADASTRO_BLOQUEANTE, Conta destino =
     própria conta de origem), em vez de abortar a execução inteira.
 
     Conta destino for the Cobrança path is created HERE (not in a later formula):
@@ -565,14 +566,14 @@ def apply_manual_group_override(
         faltantes = sorted(l_out["GRUPO"].dropna().unique().tolist())
         valor = float(l_out["Valor"].sum())
         # V3 (2026-07-27) — deixou de ser ERRO bloqueante: o lançamento volta ao
-        # base_final via reconciliar_espinha, com Status CADASTRO_PENDENTE e a
+        # base_final via reconciliar_espinha, com Status CADASTRO_BLOQUEANTE e a
         # própria Conta Contábil como destino (D3/D6 do spec da v3).
         controls.registra_razao(l_out["ID Lançamento"], "GRUPO_NAO_CADASTRADO")
         controls.add(
             "T88/Grupos", "WARNING", "GRUPO_NAO_CADASTRADO",
             f"{len(l_out):,} lançamento(s) de Cobrança (R$ {valor:,.2f}) têm GRUPO sem "
             f"cadastro no De-Para de Grupos: {faltantes}. Eles entram na base final com "
-            f"Status 'CADASTRO_PENDENTE' e a própria conta de origem como destino. "
+            f"Status 'CADASTRO_BLOQUEANTE' e a própria conta de origem como destino. "
             f"Adicione esses GRUPOs ao cadastro 'depara_grupos' (colunas Grupo · Conta "
             f"OM · Conta Contábil) e re-execute para que sejam classificados.",
             registros=len(l_out), valor=valor)
@@ -688,11 +689,111 @@ def finalize_match_conta_classe(df_matched: pd.DataFrame) -> pd.DataFrame:
 # =========================================================================
 # STAGE 4 — MATCH CLASSE × CONTA OM
 # =========================================================================
-def summarize_classe_om(df_classe_conta: pd.DataFrame) -> pd.DataFrame:
-    """Tool 59 — dedup df_classe_conta on [Nome classe de valor, Conta OM]."""
-    df = df_classe_conta[["Nome classe de valor", "Conta OM"]].drop_duplicates().copy()
-    log_step(logger, "59", "Summarized Classe × Conta OM", df)
-    return df
+def _estrutura_normalizada(df_estrutura: pd.DataFrame) -> pd.DataFrame:
+    """CONTA CONTÁBIL (como chave de join) + CONTA, sem chave nula.
+
+    V3.3 — extraído de autocorrigir_conta_om (V2/R10), que já usava exatamente
+    este recorte. Nada de novo: só deixou de ser privado de um stage.
+    """
+    est = df_estrutura[["CONTA CONTÁBIL", "CONTA"]].copy()
+    est["_chave"] = _normalize_join_key(est["CONTA CONTÁBIL"])
+    return est.dropna(subset=["_chave"])
+
+
+def mapa_conta_para_conta_om(df_estrutura: pd.DataFrame) -> dict:
+    """Conta Contábil (chave normalizada) -> Conta OM, pela Estrutura de Contas.
+
+    Fonte única da Conta OM na ferramenta. Usada pelo R10 (correção automática de
+    Conta destino) e, desde a v3.3, pelo Tool 59 do estágio 4.
+    """
+    est = _estrutura_normalizada(df_estrutura)
+    return dict(zip(est["_chave"], est["CONTA"]))
+
+
+def summarize_classe_om(
+    df_classe_conta: pd.DataFrame,
+    df_estrutura: pd.DataFrame,
+    controls: RunControls,
+) -> pd.DataFrame:
+    """
+    Tool 59 — dedup do cadastro Classe×Conta em [Nome classe de valor, Conta OM].
+
+    V3.3 (dono, 2026-08-03) — a `Conta OM` do par deixou de sair da COLUNA
+    'Conta OM' do cadastro e passa a ser DERIVADA da Estrutura de Contas, pela
+    'Cód conta contábil' da própria linha do cadastro.
+
+    Por quê: o lado esquerdo do join do Tool 60 é 'Conta GCUT', que já vem da
+    Estrutura (rename da coluna CONTA no Tool 62). O join comparava vocabulário
+    controlado (esquerda) com texto mantido à mão (direita), byte-a-byte — uma
+    divergência de caixa basta para o match falhar EM SILÊNCIO e o lançamento cair
+    no Reclassificador. Mesma boa prática que o R10 já aplicava por decisão do dono
+    em 2026-07-21 (ver autocorrigir_conta_om).
+
+    Medido no cadastro real em 2026-08-03: 693/693 linhas com a coluna idêntica à
+    Estrutura, 0 conta ausente da Estrutura, 564 pares distintos antes e depois →
+    mudança de resultado ZERO hoje. O que sai é risco latente: a aba `Unico CV` do
+    MESMO arquivo já tem 2 divergências (inertes só porque o código não lê aquela
+    coluna).
+
+    Fallback deliberado: se a conta da linha não existir na Estrutura, o par mantém
+    o valor da coluna do cadastro (com WARNING). Sem isso o par desapareceria do
+    dedup e o match sumiria em silêncio — pior que o problema original.
+    """
+    df = df_classe_conta[["Nome classe de valor", "Cód conta contábil"]].copy()
+
+    mapa = mapa_conta_para_conta_om(df_estrutura)
+    derivada = _normalize_join_key(df["Cód conta contábil"]).map(mapa)
+
+    # A coluna do cadastro virou fallback/diagnóstico. Ela NÃO está em
+    # REQUIRED_COLUMNS, então a ausência dela era KeyError cru até a v3.2.
+    if "Conta OM" in df_classe_conta.columns:
+        cadastro = df_classe_conta["Conta OM"]
+    else:
+        cadastro = pd.Series(pd.NA, index=df.index, dtype="object")
+        controls.add(
+            "T59/Classe×Conta", "WARNING", "CADASTRO_SEM_COLUNA_CONTA_OM",
+            "A aba Base do Classe×Conta não tem a coluna 'Conta OM' — a Conta OM de "
+            "cada linha foi derivada da Estrutura de Contas pela 'Cód conta contábil'. "
+            "Nenhuma ação necessária se a Estrutura estiver completa.",
+            registros=len(df))
+
+    conta_om = derivada.where(derivada.notna(), cadastro)
+
+    divergentes = derivada.notna() & cadastro.notna() & (derivada != cadastro)
+    if divergentes.any():
+        exemplos = ", ".join(
+            f"conta {conta!r}: cadastro {cad!r} × Estrutura {est!r}"
+            for conta, cad, est in zip(
+                df.loc[divergentes, "Cód conta contábil"].head(5),
+                cadastro[divergentes].head(5),
+                derivada[divergentes].head(5))
+        )
+        controls.add(
+            "T59/Classe×Conta", "WARNING", "CADASTRO_CONTA_OM_DIVERGENTE",
+            f"{int(divergentes.sum()):,} linha(s) da aba Base do Classe×Conta têm "
+            f"'Conta OM' diferente da Estrutura de Contas; VALEU a Estrutura (é ela que "
+            f"o Tool 60 usa do outro lado do join). Alinhe o cadastro. Exemplos — "
+            f"{exemplos}.",
+            registros=int(divergentes.sum()))
+
+    sem_estrutura = derivada.isna()
+    if sem_estrutura.any():
+        fora_do_match = int((sem_estrutura & cadastro.isna()).sum())
+        controls.add(
+            "T59/Classe×Conta", "WARNING", "CADASTRO_CONTA_OM_SEM_ESTRUTURA",
+            f"{int(sem_estrutura.sum()):,} linha(s) da aba Base do Classe×Conta têm "
+            f"'Cód conta contábil' que não existe na Estrutura de Contas — a Conta OM "
+            f"dessas linhas veio da coluna do cadastro ({fora_do_match:,} sem nenhuma "
+            f"das duas fontes, portanto fora do match do Tool 60). Cadastre essas contas "
+            f"na Estrutura de Contas.",
+            registros=int(sem_estrutura.sum()))
+
+    out = (pd.DataFrame({"Nome classe de valor": df["Nome classe de valor"],
+                         "Conta OM": conta_om})
+           .dropna(subset=["Conta OM"])
+           .drop_duplicates())
+    log_step(logger, "59", "Summarized Classe × Conta OM (Conta OM da Estrutura)", out)
+    return out
 
 
 def match_classe_conta_om(
@@ -944,9 +1045,7 @@ def autocorrigir_conta_om(
     # Contas (gabarito — mesma fonte que build_pacote_report já usa pra um
     # propósito parecido, sem dedup adicional: 0 duplicatas na Estrutura real
     # hoje; R2 já cobre cadastro conflitante em preprocess_base).
-    est = df_estrutura[["CONTA CONTÁBIL", "CONTA"]].copy()
-    est["_chave"] = _normalize_join_key(est["CONTA CONTÁBIL"])
-    est = est.dropna(subset=["_chave"])
+    est = _estrutura_normalizada(df_estrutura)
     conta_para_conta_om = dict(zip(est["_chave"], est["CONTA"]))
 
     # Por Conta OM: lista de contas cadastradas, na ordem de leitura da
@@ -1427,11 +1526,14 @@ def build_final_consolidated(df_completa: pd.DataFrame,
     V3 (2026-07-28, Correção 1): a VALIDAÇÃO de 'Mes' (registra_razao +
     controls.add do WARNING `MES_INVALIDO`) saiu daqui — mora agora em
     `validar_mes`, chamada ANTES de `reconciliar_espinha` (ver docstring de lá
-    pro racional). Esta função só FORMATA (converte de novo, idempotente, e
-    escreve `DateTime_Out`) — por isso `controls` deixou de ser usado no corpo,
-    mas o parâmetro fica na assinatura (reservado: pipeline.py e outras tasks
-    chamam esta função com `controls`; não é usado aqui, mas remover quebraria
-    o contrato de chamada).
+    pro racional). Quanto ao `Mes`, esta função só FORMATA (converte de novo,
+    idempotente, e escreve `DateTime_Out`).
+
+    V3.2 (2026-07-31, Correção 2): `controls` voltou a ser usado no corpo — o
+    select final do Tool 114 emite `COLUNA_AUSENTE_NA_SAIDA` (WARNING) quando uma
+    coluna do `FINAL_OUTPUT_SCHEMA` não existe no DataFrame. Antes era só um
+    `logger.warning`, que o usuário não vê se um bloqueio posterior impedir a
+    produção do log.
     """
     df = df_completa.copy()
 
@@ -1465,11 +1567,37 @@ def build_final_consolidated(df_completa: pd.DataFrame,
     df["DateTime_Out"] = mes_dt.dt.strftime("%d/%m/%Y")
     log_step(logger, "115", "Format Mes → DateTime_Out (dd/MM/yyyy)", df)
 
-    # Tool 114 — select final (V3: 19 colunas, as 15 originais + as 4 novas)
+    # Tool 114 — select final. V3.2: 21 colunas = as 15 originais (nas mesmas
+    # posições, a carga do Matrix depende disso) + `Veiculo Legal` (16) +
+    # `ID Lançamento` (17) + `Tipo` (18) + `Status`/`Motivo`/`Ação Recomendada`.
+    # Este select é TOLERANTE por desenho (coluna do schema ausente sai ausente do
+    # arquivo, em vez de estourar KeyError), mas V3.2 (2026-07-31, Correção 2) ele
+    # deixou de ser SILENCIOSO: era só um `logger.warning`, que não chega ao usuário
+    # — um bloqueio posterior interrompe a execução antes de o log ser produzido, e
+    # a coluna saía ausente sem ninguém saber. Agora o evento passa por
+    # `controls.add`, então vai ao log E à aba "Avisos" E à tabela `warnings`.
+    # Cobre as 21 colunas, não só as que não estão em `REQUIRED_COLUMNS`
+    # (`Veiculo Legal` é a única do schema que a leitura não exige — de propósito:
+    # exigi-la criaria bloqueio novo para um mês que legitimamente não a tenha,
+    # contra a filosofia da v3 de marcar em vez de barrar).
+    # `missing` sai na ORDEM DO SCHEMA (lista, não set): a mensagem tem de ser
+    # determinística para poder ser comparada entre rodadas.
     keep = [c for c in FINAL_OUTPUT_SCHEMA if c in df.columns]
-    missing = set(FINAL_OUTPUT_SCHEMA) - set(df.columns)
+    missing = [c for c in FINAL_OUTPUT_SCHEMA if c not in df.columns]
     if missing:
-        logger.warning(f"[Tool 114] Missing columns in final schema: {missing}")
+        # Código NÃO entra no CATALOGO_RAZOES: não é razão POR LANÇAMENTO (afeta o
+        # arquivo inteiro, não uma linha), e `controls.add` não exige catálogo — só
+        # `registra_razao` valida contra ele (controls.py). Nome distinto do
+        # `COLUNAS_FALTANDO` de propósito: aquele é bloqueio na LEITURA dos inputs;
+        # este é aviso na ESCRITA da saída.
+        controls.add(
+            "T114/Select final", "WARNING", "COLUNA_AUSENTE_NA_SAIDA",
+            f"{len(missing)} coluna(s) do schema de carga não existem no resultado e "
+            f"saem AUSENTES do arquivo final: {missing}. As demais colunas mantêm a "
+            f"ordem do schema, mas a posição das que vêm DEPOIS da ausente muda — "
+            f"confira o cadastro de carga do Matrix antes de usar este arquivo. Se a "
+            f"coluna vem da Base de Fechamento, confira se o arquivo do mês a tem.",
+            registros=len(missing))
     df_out = df[keep].copy()
 
     # V3 — split em 2 abas, ambas no mesmo schema de carga
@@ -1569,6 +1697,22 @@ def build_exceptions(dropped_contas, df_base_pos_t63, df_cc_cadastro,
             centros = pd.DataFrame(columns=cols)
     else:
         centros = pd.DataFrame(columns=cols)
+        # V3.3 — o Status CADASTRO_BLOQUEANTE cobre Centro de Custo; se a checagem
+        # não rodou, isso tem de aparecer. Antes o ramo era silencioso e a ausência
+        # do cadastro opcional fazia a rodada parecer limpa de CC.
+        if BASE_CC_CODE_COL not in df_base_pos_t63.columns:
+            motivo = f"a Base de Fechamento não tem a coluna '{BASE_CC_CODE_COL}'"
+        elif df_cc_cadastro is None:
+            motivo = "o cadastro de Entidades×CC não foi enviado"
+        else:
+            motivo = (f"o cadastro de Entidades×CC não tem a coluna "
+                      f"'{CC_CADASTRO_CODE_COL}'")
+        controls.add(
+            "T201/CC", "WARNING", "CADASTRO_CC_NAO_VERIFICADO",
+            f"A checagem de Centro de Custo NÃO rodou porque {motivo} — nenhum "
+            f"lançamento recebeu 'CC_NAO_CADASTRADO', logo o Status "
+            f"'{STATUS_CADASTRO_BLOQUEANTE}' desta rodada NÃO cobre Centro de Custo. "
+            f"Envie o cadastro de Entidades×CC para ter a verificação completa.")
     log_step(logger, "201", "Exceções — Centros de Custo não cadastrados", centros)
 
     # --- V2/R9: Bloqueio de prefixo de Conta Contábil (Arbitrado + Reclassificador) ---

@@ -6,7 +6,8 @@
 > arquivo/linha de origem. Cobre o excel de exceções (`BBV001-Excecoes_nao_cadastrados.xlsx` — nome
 > real gravado pelo código, `bbv001_reclassificacao.py:77`/`:363`), o `OutputField` opcional
 > `warnings` e — **novo na v3** — o schema da `base_final`
-> (§8: 2 abas × 19 colunas, enum de `Status`, catálogo de `Motivo` por lançamento). Não inclui a
+> (§8: 2 abas × **21 colunas** desde a v3.2, enum de `Status`, catálogo de `Motivo` por lançamento;
+> §8.6 = o que o Matrix de fato lê desse arquivo). Não inclui a
 > `base_reclassificador`. Racional de cada aba: `README_V3.md` §"Transparência ao usuário"; racional
 > de cada controle: `docs/SPEC_V2.md` + `docs/superpowers/specs/2026-07-27-v3-base-final-completa-design.md`
 > do projeto de análise.
@@ -41,7 +42,7 @@ pós-filtro de Classes de Valor (T63) — mesmo universo da aba "Contas Contábe
 
 | Coluna | Tipo | Nulo? | Descrição |
 |---|---|---|---|
-| Código | Texto | Não | Centro de Custo (alfanumérico preservado — comparação por string normalizada, não `to_numeric`) |
+| Código | Texto | Não | Centro de Custo (alfanumérico preservado — comparação por string normalizada, não `to_numeric`). **V3.2:** a coluna já chega aqui como texto porque a coerção passou a acontecer na **leitura** da Base de Fechamento (§8.2) — antes era texto por acidente do caminho, agora é por contrato |
 | Descrição | Texto | Não | `Nome do Centro de Custo` vindo da base do realizado |
 | Valor | Numérico (float) | Não | soma do `Valor` de todos os lançamentos com esse Código |
 
@@ -87,7 +88,7 @@ por lançamento é a própria `base_final` (§8).
 | Nome conta contábil | Texto | **Sim** | vem do Único CV — sempre nulo em linhas de origem Reclassificador (esse caminho não passa pelo Único CV) |
 | Nome da Classe de Valor | Texto | Não | |
 | Valor | Numérico (float) | Não | pode ser **negativo** na soma agregada dos avisos (ver §"Avisos" abaixo) mesmo que cada linha individual não seja |
-| Centro de Custo | Texto | Não | |
+| Centro de Custo | Texto | Não | **V3.2:** texto por contrato — coagido na leitura da base (§8.2) |
 | Nome do Centro de Custo | Texto | Não | |
 | Motivo | Texto — enum `"PREFIXO_818_CRUZADO"` \| `"PREFIXO_FAMILIA_8_CRUZADO"` | Não | qual das 2 regras de família disparou (nunca as duas ao mesmo tempo — mutuamente exclusivas por construção) |
 | Conta OM | Texto | Não (na wiring atual — `autocorrigir_conta_om` sempre roda antes) | Conta OM da `Conta destino`, usada para montar `Ação Recomendada` |
@@ -191,6 +192,7 @@ passar por `RunControls` (marcados **†**, nunca aparecem na aba "Avisos"/tabel
 | R9/Prefixo | WARNING | `PREFIXO_818_CRUZADO` | Sim |
 | R9/Prefixo | WARNING | `PREFIXO_FAMILIA_8_CRUZADO` | Sim |
 | R10/AutoCorrecao | INFO | `PREFIXO_CORRIGIDO_AUTOMATICAMENTE` | Sim |
+| T114/Select final | WARNING | `COLUNA_AUSENTE_NA_SAIDA` | Sim — **novo na v3.2** (2026-07-31). Uma coluna do `FINAL_OUTPUT_SCHEMA` não existe no resultado e sai **ausente do arquivo**. É aviso de **arquivo**, não de lançamento: não está (nem deve estar) no `CATALOGO_RAZOES`, e não tem `Status` correspondente. Antes era só um `logger.warning`, que o usuário não vê se um bloqueio posterior impedir a produção do log. Cobre as **21** colunas — inclusive `Veiculo Legal`, a única do schema que não está em `REQUIRED_COLUMNS` |
 
 **Códigos da v2 que deixaram de existir na v3** (não são emitidos por nenhum `controls.add`/`erro` —
 conferido por grep em `bbv001_reclassificacao-v3/`): `BASE_VAZIA_POS_FILTROS` (o universo agora é a
@@ -219,7 +221,7 @@ aparecer. Nomes de coluna em minúsculo (contrato declarado no admin do PPR, ver
 Cadastro deste `OutputField` é **opcional** — sem ele, o mesmo conteúdo já sai na aba "Avisos" do excel
 de exceções e no resumo do `log_execucao`.
 
-## 8. `base_final` (V3) — 2 abas × 19 colunas, com marcação por lançamento
+## 8. `base_final` (V3) — 2 abas × 21 colunas, com marcação por lançamento
 
 **A mudança central da v3.** Até a v2, o `base_final` continha só os lançamentos que a cascata
 conseguiu classificar — os problemáticos eram descartados (em silêncio ou como agregado no excel de
@@ -238,7 +240,7 @@ marcada com `Status` / `Motivo` / `Ação Recomendada`. Fonte:
 | 1 | `Consolidado` (nome mantido da v2 — não quebra quem já consome) | universo gerencial | `Status != FORA_DE_ESCOPO` |
 | 2 | `Fora de Escopo` | só os lançamentos de Classe de Valor excluída por configuração (Tool 63) | `Status == FORA_DE_ESCOPO`, i.e. `Nome da Classe de Valor ∈ EXCLUDED_VALUE_CLASSES` |
 
-Mesmo schema de 19 colunas nas duas, na mesma ordem, **inclusive quando uma delas está vazia** (a aba
+Mesmo schema de 21 colunas nas duas, na mesma ordem, **inclusive quando uma delas está vazia** (a aba
 é sempre escrita, com o cabeçalho). É uma **partição exata**: nenhum lançamento fica nas duas nem
 fora das duas. `ID Lançamento` e `Índice ERP` são únicos **globalmente** entre as 2 abas.
 
@@ -246,10 +248,13 @@ fora das duas. `ID Lançamento` e `Índice ERP` são únicos **globalmente** ent
 lançamento em `EXCLUDED_VALUE_CLASSES`) — o split só foi exercitado por teste sintético. Números em
 §8.5.
 
-### 8.2 As 19 colunas (`config.FINAL_OUTPUT_SCHEMA`, `engine/config.py:167-190`)
+### 8.2 As 21 colunas (`config.FINAL_OUTPUT_SCHEMA`, `engine/config.py:179-210`)
 
-As **15 primeiras são as da v2, nas mesmas posições** (a carga do Matrix depende da ordem); as 4
-últimas são novas e ficam sempre no fim.
+As **15 primeiras são as da v2, nas mesmas posições** (a carga do Matrix depende da ordem). As 6
+restantes entraram em duas rodadas: 4 na v3 (auditoria por lançamento) e **2 na v3.2** —
+`Veiculo Legal` na posição **16** e `Tipo` na **18**, ordem escolhida pelo dono em 2026-07-30.
+Nenhuma das 15 originais mudou de posição em nenhuma das duas rodadas. Por que acrescentar à direita
+é seguro por construção: **§8.6**.
 
 | # | Coluna | Tipo | Vazio? | Descrição |
 |---:|---|---|---|---|
@@ -257,7 +262,7 @@ As **15 primeiras são as da v2, nas mesmas posições** (a carga do Matrix depe
 | 2 | `DateTime_Out` | Texto `dd/mm/aaaa` | **Sim** | competência derivada de `Mes`; **vazio** quando `Mes` não é data válida — a linha sai com `Motivo = MES_INVALIDO` |
 | 3 | `Grupo Acionista` | Texto | Não | da base bruta |
 | 4 | `GC Matrix` | Texto | Não | `"GC-" + Grupo Conta` |
-| 5 | `Centro de Custo` | Texto | Não | alfanumérico preservado |
+| 5 | `Centro de Custo` | Texto | Não | alfanumérico preservado. **V3.2: viaja como TEXTO por contrato** (era número) — coagido por `coerce_conta_str` na **leitura** da base (`engine/io_utils.py:153`), não na escrita. Ver a nota depois da tabela |
 | 6 | `Conta destino` | Texto (conta de 25 dígitos, sempre string) | Não | conta calculada pela cascata. Para quem a cascata não classificou, é a **conta de ORIGEM** (`Conta Contabil`) — decisão D3, nenhuma reclassificação é inventada |
 | 7 | `Valor` | Numérico (float) | Não | pode ser negativo (crédito) |
 | 8 | `Moeda` | Texto | Não | constante `"BRL"` |
@@ -268,10 +273,67 @@ As **15 primeiras são as da v2, nas mesmas posições** (a carga do Matrix depe
 | 13 | `Fornecedor` | Texto | Não | |
 | 14 | `Conta Contabil` | Texto (25 dígitos, sempre string) | Não | conta de ORIGEM do lançamento |
 | 15 | `Nome da Conta` | Texto | Não | |
-| 16 | `ID Lançamento` | Inteiro | Não | **V3** — posição da linha na base bruta (`1..N`), imutável. É a **única chave verdadeira por lançamento**: `Codigo Interno` não serve, porque duplicata nativa existe e é válida. Não confundir com `RecordID` (interno, `cumcount` por `Codigo Interno`) |
-| 17 | `Status` | Texto — enum fechado (§8.3) | Não | **V3** — exatamente 1 por linha; é a coluna de filtro |
-| 18 | `Motivo` | Texto — 0..N códigos do catálogo (§8.4) separados por `"; "` | Sim (quando `Status = OK` e não houve correção automática) | **V3** — acumula **todos** os códigos aplicáveis à linha; nunca perde código |
-| 19 | `Ação Recomendada` | Texto | Sim (idem `Motivo`) | **V3** — texto pronto para o usuário, um por código de `Motivo`, concatenados na mesma ordem |
+| 16 | `Veiculo Legal` | Texto | Não observado nulo (ver ressalva abaixo) | **V3.2** — a **origem do lançamento**, vinda da Base de Fechamento. Já atravessava a cascata inteira (única menção em `engine/transforms.py:624`, o select do Tool 132) e era descartada no select final; agora entra no arquivo. A ferramenta não a transforma nem a usa em nenhum join — é passagem |
+| 17 | `ID Lançamento` | Inteiro | Não | **V3** — posição da linha na base bruta (`1..N`), imutável. É a **única chave verdadeira por lançamento**: `Codigo Interno` não serve, porque duplicata nativa existe e é válida. Não confundir com `RecordID` (interno, `cumcount` por `Codigo Interno`) |
+| 18 | `Tipo` | Texto — 7 valores possíveis (lista abaixo) | Não | **V3.2** — o **mecanismo que classificou** o lançamento. Mesma coluna que a tabela `auditoria` agrega; já existia em `base_completa` com zero nulos, só não estava no schema de saída |
+| 19 | `Status` | Texto — enum fechado (§8.3) | Não | **V3** — exatamente 1 por linha; é a coluna de filtro |
+| 20 | `Motivo` | Texto — 0..N códigos do catálogo (§8.4) separados por `"; "` | Sim (quando `Status = OK` e não houve correção automática) | **V3** — acumula **todos** os códigos aplicáveis à linha; nunca perde código |
+| 21 | `Ação Recomendada` | Texto | Sim (idem `Motivo`) | **V3** — texto pronto para o usuário, um por código de `Motivo`, concatenados na mesma ordem |
+
+#### `Centro de Custo` como texto — a coerção é na LEITURA, e por isso vale para os 3 consumidores
+
+Até a v3.1 a coluna viajava como **número** (`int` em 100% das linhas nos dois meses validados —
+6 dígitos em Abr26, 9 em Jun26). Na **v3.2** ela é coagida a texto em
+`io_utils.read_base_fechamento` (`engine/io_utils.py:153`, via `controls.coerce_conta_str`), ou seja
+**antes** de qualquer consumidor. Consequência de contrato, deliberada: passam a receber texto os
+**três** destinos da coluna —
+
+1. o **arquivo de carga** (esta tabela, coluna 5);
+2. a **base enviada ao reclassificador**, onde a coluna é renomeada para `Código Centro de Custo`
+   (`engine/reclassifier_bridge.py:42`) — ver a pendência aberta em
+   `docs/PENDENCIAS_E_FOLLOWUPS.md` §A5;
+3. as **abas do excel de exceções** que carregam o CC (§2 "Centros de Custo" e §4 "Bloqueio Prefixo
+   Conta").
+
+Coagir só na escrita deixaria dois dos três recebendo número — era exatamente a inconsistência a
+resolver. **Não há perda de precisão** (9 dígitos cabem em `int64` com folga); o ganho é consistência
+de tipo, e o fato que a torna segura é que **o Matrix lê `Centro de Custo` como texto** (dono,
+2026-07-30 — §8.6). O único join que usa a coluna (cadastro de CC no relatório de exceções) normaliza
+os dois lados via `_normalize_join_key` antes de comparar, então `"220344"` e `220344` convergem e o
+match não muda.
+
+Verificado no arquivo **gravado**, nos dois meses: `0 célula numérica`, tipo observado `['str']` e só
+`str` (V1d-8 da bateria — `.superpowers/sdd/task-3b-v32-fix-report.md` §2).
+
+#### Os 7 valores de `Tipo` (`tests/bateria_v3_abr26_jun26.py`, constante `TIPOS_ESPERADOS`)
+
+Os 6 mecanismos da cascata mais o bucket dos que voltaram sem passar por ela:
+
+`Match conta x classe` · `Match classe conta OM` · `Arbitrado classe` · `Reclassificador` ·
+`Cobrança` · `Consultorias` · **`Não classificado`**
+
+`"Não classificado"` é o `Tipo` dos lançamentos **devolvidos pela reconciliação** — aqueles que a
+cascata não classificou e que a v3 traz de volta com a `Conta destino` = conta de **origem**
+(`engine/transforms.py:1381`). É o mesmo bucket da tabela `auditoria`. Casos que caem nele: conta sem
+match na Estrutura (`CONTA_NAO_CADASTRADA`), GRUPO sem cadastro (`GRUPO_NAO_CADASTRADO`) e
+`FALHA_INTERNA` (`PERDA_NAO_EXPLICADA`). **Não** é "sem destino calculado por erro" — é preservação de
+valor, declarada.
+
+**Medido no arquivo gravado:** **6** valores em Abr26 e **7** em Jun26. A diferença é exatamente
+`"Não classificado"`, que só existe em Jun26 — são os **18** lançamentos sem match na Estrutura de
+Contas, a única diferença de contagem v2→v3 de todo o exercício (Abr26 não tem nenhum). Fonte:
+`.superpowers/sdd/task-3-v32-report.md` §4/§6 e `.superpowers/sdd/task-3b-v32-fix-report.md` §2.
+Distribuição completa de Jun26 por `Tipo` × `Status`: `task-3-v32-report.md` §6.
+
+⚠️ **`Veiculo Legal` — cobertura medida, obrigatoriedade NÃO confirmada.** No arquivo gravado a
+coluna veio **preenchida em 100% das linhas** nos dois meses (106.188 de 106.188 em Abr26; 87.204 de
+87.204 em Jun26 — V1d-9, `task-3b-v32-fix-report.md` §2), e a bateria passou a exigir **cobertura
+total** por causa disso. Mas **não há confirmação de regra de negócio do Banco BV** de que a coluna é
+obrigatória em todo lançamento — a base é a observação empírica de 2 meses. `Veiculo Legal` também
+**não está** em `config.REQUIRED_COLUMNS["base_fechamento"]`: se ela faltar no arquivo do mês, a
+leitura **não** bloqueia e o select final a omite com apenas um warning no log (ver a nota do select
+silencioso, §8.6). Se um mês futuro reprovar a V1d-9, o tratamento é **investigar**, não suavizar a
+condição do teste (`docs/PENDENCIAS_E_FOLLOWUPS.md` §C8).
 
 ⚠️ **Cobertura:** a mudança de significado do sufixo `_N` (coluna 1) **não foi exercitada por dado
 real** em nenhum dos dois meses validados — Abr26 e Jun26 não têm duplicação de join (só Jun26 tem
@@ -285,18 +347,40 @@ Verificado no arquivo gravado nos dois meses (nenhuma célula voltou como númer
 
 ### 8.3 Enum de `Status`
 
-**6 valores** (`FALHA_INTERNA` entrou na v3.1). Ordem abaixo = **precedência** quando a linha
-acumula problemas de famílias diferentes (`config.STATUS_PRECEDENCIA`) — do mais grave ao menos
-grave. `FORA_DE_ESCOPO` vem primeiro porque define a **aba**; `FALHA_INTERNA` vem logo depois,
-vencendo todos os demais; nas restantes, falta de destino é mais grave que destino suspeito.
-**Só o `Status` é único — o `Motivo` nunca perde código.**
+**7 valores** (`FALHA_INTERNA` entrou na v3.1; `CADASTRO_BLOQUEANTE` entrou na **v3.3**, 2026-08-03).
+Ordem abaixo = **precedência** quando a linha acumula problemas de famílias diferentes
+(`config.STATUS_PRECEDENCIA`) — do mais grave ao menos grave. `FORA_DE_ESCOPO` vem primeiro porque
+define a **aba**; `FALHA_INTERNA` vem logo depois, vencendo todos os demais; `CADASTRO_BLOQUEANTE`
+entra na posição 2 (acima de `CADASTRO_PENDENTE`); nas restantes, falta de destino/dimensão é mais
+grave que destino suspeito. **Só o `Status` é único — o `Motivo` nunca perde código.**
 
-| `Status` | Significado | Aba | Ação de quem carrega no Matrix |
+A coluna de ação abaixo descreve o que **quem revisa a base** deveria fazer com a linha. ⚠️ **Não é
+um filtro que o Matrix aplica** — o Matrix não lê a coluna `Status` (§8.6): a revisão é decisão do
+cliente.
+
+✅ **Desde a v3.3 (2026-08-03) a rede de segurança da carga volta a ser enunciável por `Status`** —
+mas o enunciado **não é "`CADASTRO_PENDENTE` tem rede" (isso continua errado, e foi o erro corrigido em
+2026-07-31)**: é **`CADASTRO_BLOQUEANTE`** que reúne exatamente os 3 códigos que faltam cadastro de
+**dimensão** (`CONTA_NAO_CADASTRADA`, `GRUPO_NAO_CADASTRADO`, `CC_NAO_CADASTRADO`), separados do
+`CADASTRO_PENDENTE` (que agora é só a família `CLASSE_*`, sempre informativa). **Isso não promete
+"sem destino calculado" para os 3 códigos** — só `CONTA_NAO_CADASTRADA` e `GRUPO_NAO_CADASTRADO` (os
+que de fato tiram o lançamento da cascata — `config.CODIGOS_QUE_REMOVEM_LANCAMENTO`, que **não**
+mudou nesta versão) deixam a linha com a conta de **origem**; `CC_NAO_CADASTRADO` mantém a `Conta
+destino` **calculada e cadastrada** — o que falta é a **dimensão Centro de Custo**, não a conta. A
+recusa na carga é **fato, confirmado pelo dono (2026-08-04)** para os três — nas duas variantes
+(recusa por `Conta destino` fora do plano; recusa por `Centro de Custo` fora do cadastro):
+`docs/PENDENCIAS_E_FOLLOWUPS.md §A7` (fechada). Medido: **Abr26, `CADASTRO_BLOQUEANTE` = 0** (lacuna de
+cobertura por dado real — só teste sintético); **Jun26, `CADASTRO_BLOQUEANTE` = 186 / −R$
+26.405.479,23** (17 `CONTA_NAO_CADASTRADA`, 164 `CC_NAO_CADASTRADO`, 5 em combinação — ver §8.5).
+Detalhe e números em `README_V3.md`, "Advertência operacional".
+
+| `Status` | Significado | Aba | Ação de quem revisa a base antes de carregar |
 |---|---|---|---|
 | `FORA_DE_ESCOPO` | filtro de escopo por desenho (Classe de Valor excluída) | 2 | nenhuma — é intencional |
 | `FALHA_INTERNA` | **V3.1** — defeito da **própria ferramenta**: o lançamento sumiu da cascata sem que nenhuma etapa registrasse o motivo (`Motivo = PERDA_NAO_EXPLICADA`). Voltou à base com a `Conta destino` = conta de **origem** e `Tipo = "Não classificado"`, para o valor não se perder | 1 | ⛔ **não carregar esta linha** e **avisar o time responsável pela ferramenta**, informando o `ID Lançamento`. **Não** é problema de cadastro do cliente — não há nada a corrigir no input |
-| `CADASTRO_PENDENTE` | falta cadastro a montante | 1 | cadastrar o item apontado e re-executar no ciclo seguinte |
-| `DESTINO_SUSPEITO` | tem destino calculado, mas a regra desconfia dele | 1 | ⚠️ **decidir se carrega** — ver a advertência da D4 no `README_V3.md` |
+| `CADASTRO_BLOQUEANTE` | **V3.3 (2026-08-03)** — falta cadastro de **dimensão** que a carga no Matrix precisa: Conta Contábil (`CONTA_NAO_CADASTRADA`), GRUPO de Cobrança (`GRUPO_NAO_CADASTRADO`) ou Centro de Custo (`CC_NAO_CADASTRADO`). ⚠️ **Não é sinônimo de "carrega conta de origem"** — só os 2 primeiros; o `CC_NAO_CADASTRADO` mantém a `Conta destino` calculada | 1 | cadastrar a dimensão apontada e re-executar. Rede de carga **confirmada** (§A7, fechada) — para `CONTA_NAO_CADASTRADA`/`GRUPO_NAO_CADASTRADO` é sobre a `Conta destino`; para `CC_NAO_CADASTRADO` é sobre o `Centro de Custo` |
+| `CADASTRO_PENDENTE` | **V3.3: passou a significar só uma coisa** — família `CLASSE_*` (`CLASSE_NAO_CADASTRADA`, `CLASSE_RENOMEADA`, `CLASSE_SEM_UNICO_CV`), sempre **informativa** | 1 | cadastrar/alinhar a Classe de Valor e re-executar. A linha leva destino **calculado e cadastrado** e **entra no Matrix normalmente** — nenhuma rede |
+| `DESTINO_SUSPEITO` | tem destino calculado, mas a regra desconfia dele | 1 | ⚠️ **decidir se carrega — sem nenhuma rede:** a conta é **válida e cadastrada**, só de família errada, então o Matrix **aceita** e nada acusa. ⚠️ E **não filtre por este `Status` para achar todos**: a precedência põe `CADASTRO_BLOQUEANTE`/`CADASTRO_PENDENTE` na frente, então 1.392 linhas em Abr26 e 1.419 em Jun26 são destino suspeito exibindo outro `Status` — filtre pelos **códigos de `Motivo`**. Ver a advertência operacional no `README_V3.md` |
 | `DADO_INVALIDO` | campo da própria base inutilizável | 1 | corrigir a Base de Fechamento |
 | `OK` | classificado sem ressalva | 1 | carregar |
 
@@ -311,9 +395,9 @@ o fallback.
 |---|---|---|
 | `CV_EXCLUIDA` | `FORA_DE_ESCOPO` | `Nome da Classe de Valor` ∈ `EXCLUDED_VALUE_CLASSES` (Tool 63) |
 | `PERDA_NAO_EXPLICADA` | `FALHA_INTERNA` | **V3.1** — o lançamento sumiu da cascata sem que nenhuma etapa registrasse o motivo. É defeito do **motor**, não do input: voltou à base com a conta de origem. Ação = **não carregar a linha** e avisar o time da ferramenta com o `ID Lançamento`. Até a v3.0 este código era ERRO bloqueante e não existia no catálogo |
-| `CONTA_NAO_CADASTRADA` | `CADASTRO_PENDENTE` | `Conta Contabil` sem match na Estrutura de Contas (Tool 62) — a v2 descartava essas linhas |
-| `GRUPO_NAO_CADASTRADO` | `CADASTRO_PENDENTE` | GRUPO de Cobrança fora do `depara_grupos` (Tool 88) — **era ERRO bloqueante na v2** |
-| `CC_NAO_CADASTRADO` | `CADASTRO_PENDENTE` | Centro de Custo sem cadastro em Entidades×CC (não afeta a classificação) |
+| `CONTA_NAO_CADASTRADA` | `CADASTRO_BLOQUEANTE` **(v3.3; era `CADASTRO_PENDENTE`)** | `Conta Contabil` sem match na Estrutura de Contas (Tool 62) — a v2 descartava essas linhas |
+| `GRUPO_NAO_CADASTRADO` | `CADASTRO_BLOQUEANTE` **(v3.3; era `CADASTRO_PENDENTE`)** | GRUPO de Cobrança fora do `depara_grupos` (Tool 88) — **era ERRO bloqueante na v2** |
+| `CC_NAO_CADASTRADO` | `CADASTRO_BLOQUEANTE` **(v3.3; era `CADASTRO_PENDENTE`)** | Centro de Custo sem cadastro em Entidades×CC — **não afeta a classificação** (`Conta destino` continua calculada e cadastrada) |
 | `CLASSE_NAO_CADASTRADA` | `CADASTRO_PENDENTE` | código de Classe de Valor sem match no Classe×Conta (R5) |
 | `CLASSE_RENOMEADA` | `CADASTRO_PENDENTE` | código com match, nome do mês divergindo do cadastrado (R5) |
 | `CLASSE_SEM_UNICO_CV` | `CADASTRO_PENDENTE` | código+nome OK, sem linha na aba `Unico CV` (R5) |
@@ -364,14 +448,25 @@ Proveniência: `.superpowers/sdd/task-13-report.md` §4 (Abr26) e §5 (Jun26), s
 | aba 1 `Consolidado` | 106.188 | 87.204 |
 | aba 2 `Fora de Escopo` | 0 | 0 |
 | `Status = OK` | 95.238 / R$ 424.548.174,99 | 77.382 / R$ 567.595.232,71 |
-| `Status = CADASTRO_PENDENTE` | 2.320 / R$ 17.746.931,22 | 2.361 / −R$ 9.681.547,38 |
+| `Status = CADASTRO_BLOQUEANTE` (V3.3) | 0 / R$ 0,00 | 186 / −R$ 26.405.479,23 |
+| `Status = CADASTRO_PENDENTE` (V3.3: só `CLASSE_*`) | 2.320 / R$ 17.746.931,22 | 2.175 / R$ 16.723.931,85 |
 | `Status = DESTINO_SUSPEITO` | 8.630 / R$ 11.810.587,57 | 7.461 / −R$ 1.523.293,99 |
 | `Status = FALHA_INTERNA` (V3.1) | 0 / R$ 0,00 | 0 / R$ 0,00 |
 | `Status = DADO_INVALIDO` | 0 | 0 |
 | `Status = FORA_DE_ESCOPO` | 0 | 0 |
 
-`DADO_INVALIDO`, `FORA_DE_ESCOPO` e `FALHA_INTERNA` **não foram exercitados por dado real** nestes
-dois meses (nem `GRUPO_NAO_CADASTRADO`, cadastro completo desde 2026-07-20) — só por teste sintético.
+`DADO_INVALIDO`, `FORA_DE_ESCOPO`, `FALHA_INTERNA` e `CADASTRO_BLOQUEANTE` em Abr26 **não foram
+exercitados por dado real** nestes dois meses (nem `GRUPO_NAO_CADASTRADO`, cadastro completo desde
+2026-07-20) — só por teste sintético.
+
+📌 **V3.3 (2026-08-03) — a linha `CADASTRO_PENDENTE` de 2026-07-28/29 foi PARTIDA em duas**, sem
+mudar nenhum outro número desta tabela (prova mecânica: `diff` do log inteiro da bateria contra a
+rodada anterior — `.superpowers/sdd/task-6-v33-report.md` §Rodada A). Em Jun26, `CADASTRO_BLOQUEANTE`
+(186 / −R$ 26.405.479,23) + `CADASTRO_PENDENTE` novo (2.175 / R$ 16.723.931,85) somam
+**exatamente** os 2.361 / −R$ 9.681.547,38 registrados em 2026-07-28/29 — é relabeling puro, não
+reclassificação. Em Abr26 o mês não tem nenhum lançamento com os 3 códigos de dimensão, então
+`CADASTRO_BLOQUEANTE` sai zero e a Task 13 anterior (2.320 / R$ 17.746.931,22) permanece idêntica.
+Proveniência: `.superpowers/sdd/task-6-v33-report.md` §Rodada A (bateria V1-V9 + V3d nova).
 
 **A linha de `FALHA_INTERNA` foi medida na v3.1, não inferida.** Proveniência:
 `.superpowers/sdd/task-4-v31-report.md` §3/§5 — a bateria ganhou a verificação **V9**
@@ -388,11 +483,47 @@ real**: quem o exercita é a V6 sintética da bateria (5 asserções) e
 > `RECLASSIFICADOR_FALLBACK`. Com a API real esses lançamentos recebem conta ajustada e tendem a sair
 > `OK`. O caminho Reclassificador segue sem validação ponta a ponta em dado real.
 
+### 8.6 O que o Matrix de fato lê deste arquivo (dono, 2026-07-30)
+
+**Fato que o dono confirmou e que muda como o arquivo deve ser lido: o Matrix lê as primeiras N
+colunas cadastradas e IGNORA tudo o que estiver à direita disso.** Não é tolerância acidental — é o
+comportamento do cadastro de carga. Três consequências, todas de desenho:
+
+1. **Acrescentar coluna à direita é seguro por construção.** Nenhuma coluna nova além da última
+   posição cadastrada pode quebrar a carga, porque o Matrix não chega a ler. Foi o que permitiu somar
+   6 colunas (4 na v3, 2 na v3.2) sem tocar nas 15 originais nem no cadastro. O que **não** é seguro
+   é mexer na **ordem** das 15 primeiras — daí a trava de posição no schema e o teste que a verifica.
+2. **As 4 colunas de auditoria (`ID Lançamento`, `Status`, `Motivo`, `Ação Recomendada`) NÃO chegam ao
+   Matrix — e isso é por desenho.** Elas existem para quem **lê e revisa** o arquivo (pessoa,
+   planilha, script), não para a plataforma. ⚠️ Corolário importante: **não existe "filtrar por
+   `Status` na carga do Matrix"** — a coluna não chega lá. O que existe é a revisão da base **antes**
+   de carregar, que é decisão do cliente (`README_V3.md`, "Advertência operacional").
+3. **`Veiculo Legal`, na posição 16, só chega ao Matrix se o cadastro crescer para 16 colunas.** Com o
+   cadastro em 15, a coluna está no arquivo e é ignorada — a ferramenta cumpriu a parte dela. Crescer
+   o cadastro é **ação de quem mantém o cadastro do Matrix, não do código**
+   (`docs/PENDENCIAS_E_FOLLOWUPS.md` §A3).
+
+**`Centro de Custo` (posição 5) o Matrix lê como TEXTO** (dono, 2026-07-30) — é esse fato que torna a
+mudança da v3.2 segura do lado do consumidor, e não só consistente do lado do produtor.
+
+⚠️ **O select final é TOLERANTE, mas não é mais silencioso** (`engine/transforms.py`, Tool 114):
+coluna que está no `FINAL_OUTPUT_SCHEMA` mas falta no `DataFrame` continua saindo **ausente do
+arquivo** (não há erro — é por desenho, para não barrar o mês), **mas desde a v3.2 (2026-07-31,
+Correção 2) o evento passa por `controls.add`** e sai como WARNING `COLUNA_AUSENTE_NA_SAIDA` no log,
+na aba "Avisos" **e** na tabela `warnings`. Antes era só um `logger.warning` — e como um bloqueio
+posterior interrompe a execução antes de o log ser produzido, esse aviso **não chegava ao usuário**.
+A guarda cobre as **21** colunas, não só as que a leitura não exige. Independente disso, a bateria
+segue conferindo no arquivo **gravado** que as colunas chegaram **com valor** — não só que estão na
+constante do schema. ⚠️ **`Veiculo Legal` NÃO foi acrescentada a `REQUIRED_COLUMNS`** de propósito:
+criaria bloqueio novo para um mês que legitimamente não a tenha, contra a filosofia da v3 de marcar
+em vez de barrar, e não há confirmação de que a coluna é obrigatória
+(`docs/PENDENCIAS_E_FOLLOWUPS.md §C8`).
+
 ## 9. O que cadastrar no admin do PPR (OutputFields)
 
 | `OutputField` | Tipo | Situação |
 |---|---|---|
-| `base_final` | Arquivo | já existe — **passa a ter 2 abas** (§8.1) e 19 colunas em vez de 15 |
+| `base_final` | Arquivo | já existe — **passa a ter 2 abas** (§8.1) e **21 colunas** em vez de 15 (19 na v3.0/v3.1; `Veiculo Legal` e `Tipo` entraram na v3.2). Nada a mudar no admin do PPR por causa disso; o cadastro que pode precisar crescer é o **do Matrix**, e só se `Veiculo Legal` tiver de ser lida (§8.6) |
 | `auditoria` | Tabela | já existe — na v3 agrega o **universo completo** por `Tipo`, com o bucket `"Não classificado"` |
 | `auditoria_status` | Tabela (`status` [Texto], `registros` [Inteiro], `soma_valor` [Texto — BR formatado por `_fmt_valor_br`]) | ⚠️ **PENDENTE — precisa ser cadastrado.** `main()` **sempre** emite esta chave (`bbv001_reclassificacao.py:336`, a quebra do mesmo universo por `Status`); não temos como saber daqui se a plataforma ignora chave não cadastrada ou devolve erro. Confirmar com o time de analytics antes de subir |
 | `warnings` | Tabela (§7) | opcional |

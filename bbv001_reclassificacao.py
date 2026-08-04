@@ -328,8 +328,8 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
     # 5) Monta os parâmetros de saída
     parametros_saida = {
         "auditoria": json.dumps(audit_rows, ensure_ascii=False),
-        # V3 — quebra por Status (FORA_DE_ESCOPO/FALHA_INTERNA/CADASTRO_PENDENTE/
-        # DESTINO_SUSPEITO/DADO_INVALIDO/OK — ordem de precedência, config.STATUS_
+        # V3 — quebra por Status (FORA_DE_ESCOPO/FALHA_INTERNA/CADASTRO_BLOQUEANTE/
+        # CADASTRO_PENDENTE/DESTINO_SUSPEITO/DADO_INVALIDO/OK — ordem de precedência, config.STATUS_
         # PRECEDENCIA) do mesmo universo completo acima. PENDENCIA: este OutputField
         # ainda não existe no admin do PPR — precisa ser cadastrado pelo time de
         # analytics antes desta chave ter efeito na plataforma (mesma natureza da

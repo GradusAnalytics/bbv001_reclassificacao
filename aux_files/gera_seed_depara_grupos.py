@@ -11,11 +11,12 @@ pelo próprio usuário, sem deploy de código.
 
 V3.1 (2026-07-30): a aba do arquivo gravado tem de se chamar exatamente o que
 `read_depara_grupos` espera (`INPUT_FILES["depara_grupos"]["sheet"]`, default
-`De-Para Grupos`) — lido daqui, nunca hardcoded, para template e leitor não
-poderem divergir. Sem isso, no layout de ARQUIVO ÚNICO (todos os cadastros em
-abas do mesmo arquivo) a aba 0 pertenceria a outro cadastro e o fallback do
-leitor cairia na aba errada; no arquivo isolado o fallback mascarava o problema
-(achado da revisão final da v3.1)."""
+`De-Para Grupos` até a v3.2; **`Grupos Cobrança` desde a v3.3**, 2026-08-03) —
+lido daqui, nunca hardcoded, para template e leitor não poderem divergir. Sem
+isso, no layout de ARQUIVO ÚNICO (todos os cadastros em abas do mesmo arquivo)
+a aba 0 pertenceria a outro cadastro e o fallback do leitor cairia na aba
+errada; no arquivo isolado o fallback mascarava o problema (achado da revisão
+final da v3.1)."""
 import os
 import sys
 

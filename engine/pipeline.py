@@ -126,7 +126,8 @@ def run_pipeline(base_reclassificada_override=None) -> dict:
     # -------------------------------------------------------------------
     # STAGE 4 — MATCH CLASSE × CONTA OM
     # -------------------------------------------------------------------
-    df_class_om          = t.summarize_classe_om(df_class)
+    # V3.3 — a Conta OM do par vem da Estrutura de Contas, não da coluna do cadastro
+    df_class_om          = t.summarize_classe_om(df_class, df_estrutura, controls)
     unm_60, match_60     = t.match_classe_conta_om(unm_49, df_class_om)
     match_om_final       = t.finalize_match_classe_conta_om(match_60)
 

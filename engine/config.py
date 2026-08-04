@@ -67,7 +67,11 @@ INPUT_FILES = {
         # impedia o layout de um arquivo único com todos os cadastros em abas (a
         # posição 0 seria a aba de outro input). O fallback preserva os arquivos de
         # depara_grupos já em uso, cuja aba pode ter qualquer nome.
-        "sheet": os.environ.get("BBV001_DEPARA_GRUPOS_SHEET", "De-Para Grupos"),
+        # V3.3 (dono, 2026-08-03) — a aba passou a se chamar 'Grupos Cobrança'. É o nome
+        # que o arquivo mestre de cadastros já usa. O fallback para a 1ª aba continua,
+        # então arquivo legado (aba 'Sheet1', que é o caso de TODAS as rodadas até 08-03)
+        # segue rodando.
+        "sheet": os.environ.get("BBV001_DEPARA_GRUPOS_SHEET", "Grupos Cobrança"),
         "sheet_fallback": 0,
     },
 }
@@ -88,6 +92,27 @@ REQUIRED_COLUMNS = {
     "classe_valor_conta_unico_cv": ["Classe de valor", "Como tratar?", "Código conta contábil"],
     "estrutura_contas": ["CONTA CONTÁBIL", "CONTA", "PACOTE"],
     "depara_grupos": ["Grupo", "Conta OM", "Conta Contábil"],
+}
+
+# --- V3.3 — aliases de coluna e markers de cabeçalho -------------------------
+# O arquivo mestre de cadastros (BBV001-Classe de Valor x Conta Contábil.xlsx,
+# 2026-08-03) renomeou 3 colunas da aba Base. Aceitar as duas grafias mantém
+# legíveis o mestre E o arquivo anterior (...v1 MU.xlsx), que é o input das
+# rodadas de regressão e das medições registradas no FONTE_DA_VERDADE.
+# Sentido do dicionário: grafia encontrada no arquivo -> nome canônico do código.
+COLUNAS_ALIAS = {
+    "classe_valor_conta_base": {
+        "Nome da classe de valor": "Nome classe de valor",
+        "Cód conta contábil permitida": "Cód conta contábil",
+        "Cód Classe de Valor": "Número att",
+    },
+}
+
+# Marcadores que identificam a linha do cabeçalho real (as abas trazem linhas de
+# título acima da tabela). Qualquer um da lista serve; a ordem não importa.
+HEADER_MARKERS = {
+    "classe_valor_conta_base": ["Nome classe de valor", "Nome da classe de valor"],
+    "classe_valor_conta_unico_cv": ["Classe de valor"],
 }
 
 # --- Cadastros para o relatório de exceções (Tool 200) -------------------
@@ -192,10 +217,18 @@ FINAL_OUTPUT_SCHEMA = [
     "Fornecedor",
     "Conta Contabil",
     "Nome da Conta",
-    # V3 (2026-07-27) — 4 colunas novas, SEMPRE no fim para não mover as 15 originais
-    # de posição (a carga do Matrix depende da ordem). Racional:
-    # docs/superpowers/specs/2026-07-27-v3-base-final-completa-design.md §5.
+    # V3.2 (dono, 2026-07-30) — coluna de ORIGEM do lançamento, que já atravessava a
+    # cascata e era descartada no select final. Posição logo após as 15 originais,
+    # escolhida pelo dono: o Matrix lê as primeiras N colunas cadastradas e ignora o
+    # resto à direita, então esta só chega ao Matrix se o cadastro crescer para 16.
+    "Veiculo Legal",
+    # V3 (2026-07-27) — as 4 colunas de auditoria por lançamento. Ficam à direita
+    # de propósito: o Matrix não as lê, e não precisa.
     "ID Lançamento",
+    # V3.2 (dono, 2026-07-30) — o mecanismo que classificou o lançamento. Mesmos
+    # valores da tabela de auditoria, incluindo "Não classificado" para quem voltou
+    # sem passar pela cascata. Posição entre ID Lançamento e Status, pedida pelo dono.
+    "Tipo",
     "Status",
     "Motivo",
     "Ação Recomendada",
@@ -207,6 +240,13 @@ FINAL_OUTPUT_SCHEMA = [
 # =========================================================================
 STATUS_OK = "OK"
 STATUS_CADASTRO_PENDENTE = "CADASTRO_PENDENTE"
+# V3.3 (dono, 2026-08-03) — parte o antigo CADASTRO_PENDENTE em dois. Aqui ficam os
+# códigos em que falta um cadastro de DIMENSÃO que a carga no Matrix precisa (conta
+# contábil, centro de custo, grupo de cobrança). NÃO é sinônimo de "carrega conta de
+# origem": o CC_NAO_CADASTRADO mantém a conta calculada — o que falta é a dimensão CC.
+# O ganho é a advertência D4 voltar a ser enunciável por Status em vez de por Motivo.
+# (O Matrix não lê a coluna Status — é filtro para quem revisa antes de carregar.)
+STATUS_CADASTRO_BLOQUEANTE = "CADASTRO_BLOQUEANTE"
 STATUS_DESTINO_SUSPEITO = "DESTINO_SUSPEITO"
 STATUS_DADO_INVALIDO = "DADO_INVALIDO"
 STATUS_FORA_DE_ESCOPO = "FORA_DE_ESCOPO"
@@ -218,10 +258,14 @@ STATUS_FALHA_INTERNA = "FALHA_INTERNA"
 # Do mais grave ao menos grave. FORA_DE_ESCOPO continua em 1º porque é ele que define
 # a ABA da saída (o split de build_final_consolidated compara com ele) — trocar essa
 # posição mudaria em silêncio para qual aba a linha vai. FALHA_INTERNA vem logo depois,
-# vencendo todos os demais.
+# vencendo todos os demais. CADASTRO_BLOQUEANTE entrou na v3.3 entre FALHA_INTERNA e
+# CADASTRO_PENDENTE.
 STATUS_PRECEDENCIA = [
     STATUS_FORA_DE_ESCOPO,
     STATUS_FALHA_INTERNA,
+    # V3.3 — acima do CADASTRO_PENDENTE: quando um lançamento tem os dois, o que
+    # importa para quem carrega é o cadastro de dimensão que falta.
+    STATUS_CADASTRO_BLOQUEANTE,
     STATUS_CADASTRO_PENDENTE,
     STATUS_DESTINO_SUSPEITO,
     STATUS_DADO_INVALIDO,
@@ -247,17 +291,18 @@ CATALOGO_RAZOES = {
         STATUS_FORA_DE_ESCOPO,
         "Classe de Valor excluída do escopo por configuração; nenhuma ação necessária."),
     "CONTA_NAO_CADASTRADA": (
-        STATUS_CADASTRO_PENDENTE,
+        STATUS_CADASTRO_BLOQUEANTE,
         "Cadastre esta Conta Contábil na Estrutura de Contas e re-execute — sem isso o "
         "lançamento fica sem Pacote no Matrix."),
     "GRUPO_NAO_CADASTRADO": (
-        STATUS_CADASTRO_PENDENTE,
+        STATUS_CADASTRO_BLOQUEANTE,
         "Cadastre o GRUPO de Cobrança no de-para de grupos (colunas Grupo · Conta OM · "
         "Conta Contábil) e re-execute."),
     "CC_NAO_CADASTRADO": (
-        STATUS_CADASTRO_PENDENTE,
-        "Cadastre o Centro de Custo na Estrutura de Entidades×CC (não afeta a "
-        "classificação deste lançamento)."),
+        STATUS_CADASTRO_BLOQUEANTE,
+        "Cadastre o Centro de Custo na Estrutura de Entidades×CC. A classificação deste "
+        "lançamento NÃO foi afetada (a Conta destino é a calculada), mas a carga no "
+        "Matrix depende de o Centro de Custo existir lá."),
     "CLASSE_NAO_CADASTRADA": (
         STATUS_CADASTRO_PENDENTE,
         "Cadastre a Classe de Valor nas abas Base e Unico CV do Classe×Conta."),

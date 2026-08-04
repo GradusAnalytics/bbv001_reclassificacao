@@ -14,11 +14,13 @@ import pandas as pd
 from config import (
     INPUT_FILES,
     REQUIRED_COLUMNS,
+    COLUNAS_ALIAS,
+    HEADER_MARKERS,
     OUTPUT_RECLASSIFIER,
     OUTPUT_FINAL_CONSOLIDATED,
     OUTPUT_DIR,
 )
-from controls import BloqueioError
+from controls import BloqueioError, coerce_conta_str
 from helpers import log_step
 
 logger = logging.getLogger(__name__)
@@ -83,25 +85,49 @@ def _valida_colunas(df: pd.DataFrame, input_key: str, path, sheet) -> pd.DataFra
     return df
 
 
-def _read_excel_with_header_marker(path, sheet, marker: str, max_scan: int = 15) -> pd.DataFrame:
+def _read_excel_with_header_marker(path, sheet, marker, max_scan: int = 15) -> pd.DataFrame:
     """
     Some sheets carry title/banner rows above the real table header (e.g. the
     'Base' and 'Unico CV' sheets start with 'Titulo2'/'Titulo3' and blank rows, so a
     plain read_excel mislabels the columns as 'Unnamed: N'). Scan the first `max_scan`
-    rows for the cell equal to `marker` and use that row as the header.
+    rows for a cell equal to `marker` and use that row as the header.
+
+    V3.3 — `marker` aceita uma string OU uma lista de strings: o arquivo mestre de
+    cadastros escreve 'Nome da classe de valor' onde o anterior escrevia 'Nome classe
+    de valor', e a coluna do marker é justamente uma das renomeadas.
     """
+    markers = [marker] if isinstance(marker, str) else list(marker)
     probe = _read_excel(path, sheet_name=sheet, header=None, nrows=max_scan)
     header_row = None
     for i in range(len(probe)):
-        if probe.iloc[i].astype(str).str.strip().eq(marker).any():
+        celulas = probe.iloc[i].astype(str).str.strip()
+        if celulas.isin(markers).any():
             header_row = i
             break
     if header_row is None:
         raise ValueError(
-            f"Header marker {marker!r} not found in the first {max_scan} rows of "
+            f"Header marker {markers!r} not found in the first {max_scan} rows of "
             f"sheet {sheet!r} ({path}). The template may have changed."
         )
     return _read_excel(path, sheet_name=sheet, header=header_row)
+
+
+def _aplica_aliases(df: pd.DataFrame, input_key: str) -> pd.DataFrame:
+    """
+    V3.3 — renomeia para o nome canônico as colunas que o arquivo mestre de cadastros
+    escreve de outra forma (`config.COLUNAS_ALIAS`).
+
+    Só renomeia quando o nome canônico AINDA NÃO existe no DataFrame: se o arquivo
+    trouxer as duas grafias, a canônica ganha e nenhuma coluna é sobrescrita em
+    silêncio.
+    """
+    alias = COLUNAS_ALIAS.get(input_key, {})
+    renomear = {de: para for de, para in alias.items()
+                if de in df.columns and para not in df.columns}
+    if renomear:
+        df = df.rename(columns=renomear)
+        logger.info(f"[{input_key}] colunas renomeadas por alias (V3.3): {renomear}")
+    return df
 
 
 # -------------------------------------------------------------------------
@@ -133,9 +159,24 @@ def read_base_fechamento() -> pd.DataFrame:
     # in memory but get cast to float64 on the Excel write, losing precision
     # (8172700000000000010000000 → 8172699999999999715835904). This column also feeds
     # 'Conta destino' for the two Match paths (Tools 93/94), so the fix covers both.
-    df["Conta Contabil"] = df["Conta Contabil"].apply(
-        lambda v: v if (isinstance(v, str) or (isinstance(v, float) and pd.isna(v))) else str(v)
-    )
+    # V3.2 (dono, 2026-07-30, Step 5 do plano — ESCOPO ALÉM das 3 mudanças pedidas,
+    # ver relatório da task): trocado o lambda inline por coerce_conta_str, que já é
+    # o padrão usado no resto do projeto. O lambda antigo tratava só str e NaN-float
+    # como "já ok"; qualquer outro float (a coluna inteira vira float64 se QUALQUER
+    # linha tiver Conta Contabil nula) caía no `else str(v)` e produzia notação
+    # científica ("8.1727e+24") em vez do número por extenso — bug latente na coluna
+    # mais crítica da ferramenta. coerce_conta_str trata o caso float corretamente.
+    df["Conta Contabil"] = coerce_conta_str(df["Conta Contabil"])
+    # V3.2 (dono, 2026-07-30) — 'Centro de Custo' viaja como TEXTO. Coagir aqui, na
+    # leitura, cobre de uma vez os TRÊS consumidores: o arquivo de carga, a base do
+    # reclassificador (onde a coluna vira 'Código Centro de Custo', ver
+    # reclassifier_bridge.py) e as abas de exceção. Coagir só na escrita deixaria dois
+    # deles recebendo número. Não há risco de precisão aqui (9 dígitos cabem em int64);
+    # o ganho é consistência de tipo — o Matrix lê essa coluna como texto.
+    # Usa coerce_conta_str e NÃO um lambda inline equivalente ao que 'Conta Contabil'
+    # tinha antes desta task: se a coluna tiver qualquer nulo, o pandas a devolve
+    # float64 e aquele padrão produziria "220344.0".
+    df["Centro de Custo"] = coerce_conta_str(df["Centro de Custo"])
     log_step(logger, "4", "Read Base Fechamento + rename Valor", df)
     return df
 
@@ -150,9 +191,17 @@ def read_depara_custo() -> pd.DataFrame:
 
 
 def read_classe_valor_conta() -> pd.DataFrame:
-    """Tool 47 — sheet 'Base' (real header below a few title rows)."""
+    """Tool 47 — sheet 'Base' (real header below a few title rows).
+
+    V3.3 — marker por lista e aliases de coluna: a aba `Base` do arquivo mestre de
+    cadastros usa 'Nome da classe de valor' / 'Cód conta contábil permitida' /
+    'Cód Classe de Valor' onde o arquivo anterior usava 'Nome classe de valor' /
+    'Cód conta contábil' / 'Número att'. Os dois arquivos são legíveis.
+    """
     cfg = INPUT_FILES["classe_valor_conta"]
-    df = _read_excel_with_header_marker(cfg["path"], cfg["sheet_base"], "Nome classe de valor")
+    df = _read_excel_with_header_marker(
+        cfg["path"], cfg["sheet_base"], HEADER_MARKERS["classe_valor_conta_base"])
+    df = _aplica_aliases(df, "classe_valor_conta_base")            # V3.3 — antes da validação
     _valida_colunas(df, "classe_valor_conta_base", cfg["path"], cfg["sheet_base"])  # V2/D1
     log_step(logger, "47", "Read Classe Valor x Conta (Base)", df)
     return df
@@ -161,7 +210,8 @@ def read_classe_valor_conta() -> pd.DataFrame:
 def read_unico_cv() -> pd.DataFrame:
     """Tool 48 — sheet 'Unico CV' (real header below a few title rows)."""
     cfg = INPUT_FILES["classe_valor_conta"]
-    df = _read_excel_with_header_marker(cfg["path"], cfg["sheet_unico_cv"], "Classe de valor")
+    df = _read_excel_with_header_marker(
+        cfg["path"], cfg["sheet_unico_cv"], HEADER_MARKERS["classe_valor_conta_unico_cv"])
     _valida_colunas(df, "classe_valor_conta_unico_cv", cfg["path"], cfg["sheet_unico_cv"])  # V2/D1
     log_step(logger, "48", "Read Unico CV", df)
     return df
@@ -183,7 +233,7 @@ def read_depara_grupos() -> pd.DataFrame:
     aux_files/gera_seed_depara_grupos.py).
 
     V3.1 (2026-07-30): a aba é lida por NOME (`INPUT_FILES[...]["sheet"]`, default
-    `De-Para Grupos`), com fallback para a primeira aba do arquivo. Deixou de ser
+    `Grupos Cobrança`), com fallback para a primeira aba do arquivo. Deixou de ser
     "1 aba": o arquivo pode trazer todos os cadastros, um por aba, e o mesmo arquivo
     ser enviado em todos os campos — só a Base de Fechamento continua separada
     (ela e a aba `Base` do classe_valor_conta exigiriam o mesmo nome de aba)."""
