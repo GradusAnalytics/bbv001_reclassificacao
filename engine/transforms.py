@@ -26,6 +26,10 @@ from config import (
     CONSULTORIA_CONTA_DESTINO,
     RECLASSIFIER_OUTPUT_SCHEMA,
     FINAL_OUTPUT_SCHEMA,
+    STATUS_OK,
+    STATUS_FORA_DE_ESCOPO,
+    CODIGOS_QUE_REMOVEM_LANCAMENTO,
+    FAMILIA_PREFIXO_CONTA,
 )
 from controls import RunControls, coerce_conta_str, resolve_duplicatas_cadastro
 from helpers import (
@@ -49,11 +53,16 @@ def preprocess_base(df_base: pd.DataFrame, df_estrutura: pd.DataFrame,
     Tools 63 (filter excluded CVs) + 62 (join with Estrutura de Contas).
 
     V2: R1 (resumo das exclusões por CV) · R2 (check de duplicatas na Estrutura) ·
-    R8 (censo inicial pós-T63/pré-T62) · termos de conservação (A1).
+    termos de conservação (A1). V3: censo_duplicata_nativa (informativo, R8) + razão
+    por ID (`CV_EXCLUIDA` / `CONTA_NAO_CADASTRADA`) — é essa razão que devolve os
+    lançamentos ao base_final via `reconciliar_espinha`, em vez de descartá-los.
 
-    Retorna (j_out, l_out):
+    Retorna (j_out, l_out, df):
       j_out — base enriquecida (Conta GCUT / Pacote GCUT), segue para a cascata.
-      l_out — contas da base SEM match na Estrutura (descartadas) → relatório de exceções.
+      l_out — contas da base SEM match na Estrutura; não seguem a cascata, mas
+              voltam ao base_final (via reconciliar_espinha) com Status
+              'CADASTRO_PENDENTE' e a própria conta de origem como destino.
+      df    — base pós-T63 (universo canônico das exceções — R6).
     """
     # Tool 63 — filter excluded value classes
     mask = ~df_base["Nome da Classe de Valor"].isin(EXCLUDED_VALUE_CLASSES)
@@ -70,9 +79,12 @@ def preprocess_base(df_base: pd.DataFrame, df_estrutura: pd.DataFrame,
                          registros=int(r["count"]), valor=float(r["sum"]))
     controls.registra_termo("excluidas_t63", len(excluidas),
                             float(excluidas["Valor"].sum()) if len(excluidas) else 0.0)
+    # V3 — razão por lançamento (a linha volta ao base_final marcada, aba 2)
+    if len(excluidas) > 0:
+        controls.registra_razao(excluidas["ID Lançamento"], "CV_EXCLUIDA")
 
-    # V2/R8 — censo inicial: multiplicidade nativa por Codigo Interno (pós-T63, PRÉ-T62)
-    controls.censo_inicial(df)
+    # V3/R8 — duplicata nativa é só informativa; o censo bloqueante roda no fim, por ID
+    controls.censo_duplicata_nativa(df_base)
 
     # V2/R2 — Estrutura é relatório de sistema: duplicata de chave não deveria existir.
     # Dedup se idêntica (warning pedindo nova extração); ERRO se conflitante.
@@ -94,13 +106,17 @@ def preprocess_base(df_base: pd.DataFrame, df_estrutura: pd.DataFrame,
     if len(l_out) > 0:
         controls.add("T62/Estrutura", "WARNING", "CONTA_NAO_CADASTRADA",
                      f"{l_out['Conta Contabil'].nunique()} conta(s) contábil(is) da base não "
-                     f"existem na Estrutura de Contas — lançamentos foram para o relatório de "
-                     f"exceções (aba 'Contas Contábeis') e NÃO entram na base final.",
+                     f"existem na Estrutura de Contas — os lançamentos entram na base final "
+                     f"com Status 'CADASTRO_PENDENTE' e a própria conta de origem como "
+                     f"destino (ficam sem Pacote no Matrix até o cadastro ser feito).",
                      registros=len(l_out), valor=float(l_out["Valor"].sum()))
+        # V3 — razão por lançamento (volta ao base_final com Conta destino = origem, D3)
+        controls.registra_razao(l_out["ID Lançamento"], "CONTA_NAO_CADASTRADA")
     if len(l_out) > 0:
         logger.warning(
             f"[Tool 62] {len(l_out)} rows in base have no match in Estrutura de Contas — "
-            f"they are dropped, matching Alteryx behavior. Unique Contas: "
+            f"they skip the cascade (V3: they still return to base_final via "
+            f"reconciliar_espinha, marked CADASTRO_PENDENTE). Unique Contas: "
             f"{l_out['Conta Contabil'].nunique()}"
         )
 
@@ -118,9 +134,49 @@ def preprocess_base(df_base: pd.DataFrame, df_estrutura: pd.DataFrame,
     j_out = j_out.drop(columns=[c for c in estrutura_drop if c in j_out.columns])
     log_step(logger, "62", "Join Base × Estrutura (matched)", j_out)
     # j_out segue para a cascata EXATAMENTE como antes (paridade preservada);
-    # l_out (contas sem match) vai só para o relatório de exceções.
+    # l_out (contas sem match) não segue a cascata, mas alimenta o relatório de
+    # exceções E (V3) volta ao base_final via reconciliar_espinha (razão registrada acima).
     # V2: devolve também o frame pós-T63 (universo canônico das exceções — R6).
     return j_out, l_out, df
+
+
+def validar_mes(df_base: pd.DataFrame, controls: RunControls) -> None:
+    """
+    V3 (2026-07-28, Correção 1) — valida a coluna 'Mes' da BASE BRUTA e registra a
+    razão `MES_INVALIDO` por 'ID Lançamento'. Não devolve nada — o efeito é o
+    registro em `controls` (`registra_razao` + `controls.add` WARNING).
+
+    **Por que roda AQUI, ANTES de `reconciliar_espinha` — não mova de volta para
+    dentro de `build_final_consolidated`:** mês inválido é propriedade da LINHA DE
+    ENTRADA (já nasce inválida na Base de Fechamento), não do estágio de escrita.
+    `reconciliar_espinha` tira o SNAPSHOT de `controls.marcacao_por_id()` e estampa
+    Status/Motivo/Ação Recomendada na base final; `build_final_consolidated` roda
+    DEPOIS disso, só para formatar `DateTime_Out`. Uma razão registrada dentro de
+    `build_final_consolidated` é registrada tarde demais — ninguém mais lê o
+    snapshot depois de tirado — e o Status `DADO_INVALIDO` (que só `MES_INVALIDO`
+    produz) nunca chegaria à base final. Esse foi exatamente o bug corrigido aqui
+    (achado de revisão, 2026-07-28): a validação vivia dentro de
+    `build_final_consolidated`, rodando depois de `reconciliar_espinha`.
+
+    `build_final_consolidated` continua fazendo a CONVERSÃO/FORMATAÇÃO de 'Mes' →
+    'DateTime_Out' (isso é escrita de saída, não validação de entrada) — só a
+    validação (registra_razao + aviso) saiu de lá.
+    """
+    mes_dt = pd.to_datetime(df_base["Mes"], errors="coerce")
+    invalidas = mes_dt.isna()
+    n_invalidas = int(invalidas.sum())
+    if n_invalidas == 0:
+        return
+    controls.registra_razao(df_base.loc[invalidas, "ID Lançamento"], "MES_INVALIDO")
+    # o exemplo sai de uma linha INVÁLIDA (df_base['Mes'].iloc[0] podia ser uma data
+    # válida no caso parcial, e o "exemplo" enganaria quem for corrigir o arquivo)
+    exemplo_mes = df_base.loc[invalidas, "Mes"].iloc[0]
+    controls.add("T115/Datas", "WARNING", "MES_INVALIDO",
+                 f"{n_invalidas:,} de {len(df_base):,} lançamento(s) têm 'Mes' que não é uma "
+                 f"data válida (exemplo: {exemplo_mes!r}) — eles entram na base "
+                 f"final com DateTime_Out vazio, ou seja, SEM COMPETÊNCIA no Matrix. "
+                 f"Corrija o formato da coluna na Base de Fechamento.",
+                 registros=n_invalidas)
 
 
 def validar_cobertura_classe_valor(
@@ -134,6 +190,10 @@ def validar_cobertura_classe_valor(
     cobertura das Classes de Valor do mês, código→nome, contra o cadastro (Classe×Conta
     aba Base) e o Unico CV. Só WARNING nos 3 casos (existe fallback pelo Reclassificador;
     objetivo é visibilidade + orientação de cadastro, não bloqueio).
+
+    V3 (2026-07-27): além do aviso agregado, cada um dos 3 casos registra a razão nos
+    LANÇAMENTOS daquela classe (CLASSE_NAO_CADASTRADA / CLASSE_RENOMEADA /
+    CLASSE_SEM_UNICO_CV) — antes o achado existia só como total por classe.
 
     Mapa código→nome(s) vem da aba Base, chave = "Número att" (decisão do dono
     2026-07-20: a aba tem "Número CV" duplicado no cabeçalho do Excel — pandas lê como
@@ -161,7 +221,13 @@ def validar_cobertura_classe_valor(
 
     classes_mes = (
         df_pos_t63.groupby(["Classe de Valor", "Nome da Classe de Valor"], dropna=False)
-        .agg(registros=("Valor", "count"), valor=("Valor", "sum"))
+        # V3 — os IDs saem do MESMO groupby que os totais: um passo só na base (em vez
+        # de uma varredura por classe) e o recorte vale também para chave nula, que um
+        # `df[col] == valor` perderia em silêncio (NaN == NaN é False).
+        # Correção 3: "size" conta LINHAS (bate com a lista de IDs marcados);
+        # "count" ignoraria Valor nulo e divergiria da contagem de IDs marcados.
+        .agg(registros=("Valor", "size"), valor=("Valor", "sum"),
+             ids=("ID Lançamento", list))
         .reset_index()
     )
     classes_mes["_cod"] = _normalize_join_key(classes_mes["Classe de Valor"])
@@ -169,8 +235,11 @@ def validar_cobertura_classe_valor(
     for _, row in classes_mes.iterrows():
         cod, nome = row["_cod"], row["Nome da Classe de Valor"]
         codigo_original, registros, valor = row["Classe de Valor"], int(row["registros"]), float(row["valor"])
+        # V3 — IDs dos lançamentos desta classe, para marcar o lançamento (não só o total)
+        ids_classe = row["ids"]
 
         if cod not in mapa:
+            controls.registra_razao(ids_classe, "CLASSE_NAO_CADASTRADA")
             controls.add(
                 "T49/Unico CV", "WARNING", "CLASSE_NAO_CADASTRADA",
                 f"Classe de Valor '{nome}' (código {codigo_original!r}) não está cadastrada "
@@ -180,6 +249,7 @@ def validar_cobertura_classe_valor(
 
         nomes_cadastrados = mapa[cod]
         if nome not in nomes_cadastrados:
+            controls.registra_razao(ids_classe, "CLASSE_RENOMEADA")
             controls.add(
                 "T49/Unico CV", "WARNING", "CLASSE_RENOMEADA",
                 f"Classe de Valor código {codigo_original!r}: nome do mês {nome!r} diverge "
@@ -190,6 +260,7 @@ def validar_cobertura_classe_valor(
             continue
 
         if nome not in nomes_unico_cv:
+            controls.registra_razao(ids_classe, "CLASSE_SEM_UNICO_CV")
             controls.add(
                 "T49/Unico CV", "WARNING", "CLASSE_SEM_UNICO_CV",
                 f"Classe de Valor '{nome}' está cadastrada na aba Base mas não tem linha "
@@ -239,7 +310,8 @@ def prepare_cobranca_keys(df_cobranca: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def prepare_depara_keys(df_depara: pd.DataFrame, controls: RunControls) -> pd.DataFrame:
+def prepare_depara_keys(df_depara: pd.DataFrame,
+                        controls: RunControls) -> Tuple[pd.DataFrame, set, set]:
     """
     Tools 14 + 25 + 26 — summarize De-Para and normalize FORNECEDOR for join.
 
@@ -257,9 +329,17 @@ def prepare_depara_keys(df_depara: pd.DataFrame, controls: RunControls) -> pd.Da
       - divergência na MESMA DATA_BASE mais recente → desempate por
         SOMA(|VALOR_LANCAMENTO|) por regra nessa competência — vale a regra de
         maior valor (WARNING; decisão do dono 2026-07-13, achado real em Jun26:
-        10 chaves, nenhuma com empate de valor); só bloqueia (ERRO) se o valor
-        TAMBÉM empatar — aí não há critério e o usuário corrige o De-Para.
+        10 chaves, nenhuma com empate de valor); se o valor TAMBÉM empatar, a v2
+        bloqueava (ERRO).
     Saída com grão único por chave ⇒ o Tool 11 não duplica mais.
+
+    V3 (2026-07-27): o empate de valor deixou de bloquear — vira WARNING
+    (`DEPARA_CONFLITO_MESMA_COMPETENCIA`) e a função devolve os DOIS conjuntos de
+    chaves ambíguas para que `enrich_cobranca_with_depara` marque o LANÇAMENTO que
+    casou com elas (não só o total agregado):
+        (df_resolvido, chaves_conflito, chaves_valor)
+    Cada chave é o par normalizado (HISTORICO_2, FORNECEDOR) — mesma ordem em que o
+    join do Tool 11 compara com [HISTORICO2, Nome do Fornecedor] da base.
     """
     keys = ["HISTORICO_2", "FORNECEDOR", "FINALIZACAO", "GRUPO", "DATA_BASE"]
     df = df_depara[keys].copy()
@@ -284,6 +364,13 @@ def prepare_depara_keys(df_depara: pd.DataFrame, controls: RunControls) -> pd.Da
     n_regras = df.groupby(chave, dropna=False)[regra].nunique().max(axis=1)
     chaves_multi = n_regras[n_regras > 1].index
     resolvidas_por_valor: dict = {}
+    # V3 — declarada FORA do if: o return no fim da função usa as duas listas mesmo
+    # quando não há chave multi-regra (senão estoura NameError).
+    irresolviveis: list = []
+    # Correção 2 (2026-07-28) — (h, f) -> (FINALIZACAO, GRUPO) da PRIMEIRA linha em
+    # ordem de leitura original, só para as chaves de `irresolviveis` (empate também
+    # no valor). Declarada FORA do if pelo mesmo motivo de `irresolviveis` acima.
+    primeira_regra_irresolvivel: dict = {}
 
     if len(chaves_multi) > 0:
         multi = df.set_index(chave).loc[chaves_multi].reset_index()
@@ -306,7 +393,6 @@ def prepare_depara_keys(df_depara: pd.DataFrame, controls: RunControls) -> pd.Da
                 lambda x: remove_whitespace(decompose_unicode_for_match(x)))
             base_valor["DATA_BASE"] = pd.to_datetime(base_valor["DATA_BASE"], errors="coerce")
 
-            irresolviveis = []
             for h, f in conflitantes.index:
                 data_max = recentes.loc[
                     (recentes["HISTORICO_2"] == h) & (recentes["FORNECEDOR"] == f), "DATA_BASE"
@@ -317,17 +403,28 @@ def prepare_depara_keys(df_depara: pd.DataFrame, controls: RunControls) -> pd.Da
                           .sort_values(ascending=False)
                 if len(soma) > 1 and soma.iloc[0] == soma.iloc[1]:
                     irresolviveis.append((h, f))
+                    # Correção 2 — `sub` preserva a ordem original de df_depara (só
+                    # filtros booleanos até aqui, nenhum sort); a primeira linha
+                    # desse recorte É a primeira em ordem de leitura para esta chave,
+                    # dentre as da competência mais recente empatada.
+                    primeira = sub.iloc[0]
+                    primeira_regra_irresolvivel[(h, f)] = (
+                        primeira["FINALIZACAO"], primeira["GRUPO"])
                 else:
                     resolvidas_por_valor[(h, f)] = soma.index[0]  # (FINALIZACAO, GRUPO) vencedor
 
             if irresolviveis:
                 exemplos = "; ".join(f"({h!r}, {f!r})" for h, f in irresolviveis[:5])
-                controls.erro(
-                    "T11/De-Para", "DEPARA_CONFLITO_MESMA_COMPETENCIA",
+                # V3 (2026-07-27) — deixou de abortar: aplica a primeira em ordem de
+                # leitura e marca os lançamentos que casarem com essas chaves.
+                controls.add(
+                    "T11/De-Para", "WARNING", "DEPARA_CONFLITO_MESMA_COMPETENCIA",
                     f"O De-Para de Cobrança tem {len(irresolviveis):,} chave(s) "
                     f"histórico×fornecedor com regras DIVERGENTES na mesma competência "
-                    f"(DATA_BASE) mais recente E empate de valor — não há critério para "
-                    f"escolher. Corrija o De-Para e reenvie. Chaves (até 5): {exemplos}",
+                    f"(DATA_BASE) mais recente E empate de valor — a v3 aplicou a "
+                    f"primeira em ordem de leitura e marcou os lançamentos afetados com "
+                    f"Status 'DESTINO_SUSPEITO'. Corrija o De-Para e reenvie. "
+                    f"Chaves (até 5): {exemplos}",
                     registros=int(len(irresolviveis)))
             if resolvidas_por_valor:
                 exemplos = "; ".join(
@@ -348,8 +445,12 @@ def prepare_depara_keys(df_depara: pd.DataFrame, controls: RunControls) -> pd.Da
 
     # resolução final: por chave, fica a linha de DATA_BASE mais recente (regra
     # idêntica repetida em competências diferentes colapsa de graça — INFO)
+    # Correção 2 — kind="stable": sort_values usa quicksort por padrão, que NÃO é
+    # estável; com 3+ regras empatadas na mesma DATA_BASE, o "last" de
+    # drop_duplicates virava indefinido entre execuções. Estável preserva a ordem
+    # de leitura original entre empates — determinismo aqui é requisito.
     antes = len(df)
-    df = (df.sort_values("DATA_BASE")
+    df = (df.sort_values("DATA_BASE", kind="stable")
             .drop_duplicates(subset=chave, keep="last")
             .drop(columns=["DATA_BASE"])
             .reset_index(drop=True))
@@ -361,6 +462,15 @@ def prepare_depara_keys(df_depara: pd.DataFrame, controls: RunControls) -> pd.Da
         mask = (df["HISTORICO_2"] == h) & (df["FORNECEDOR"] == f)
         df.loc[mask, "FINALIZACAO"] = fin
         df.loc[mask, "GRUPO"] = gru
+
+    # Correção 2 — chaves IRRESOLVÍVEIS (empate também no valor): a linha que
+    # sobreviveu ao keep="last" é a ÚLTIMA em ordem de leitura entre as empatadas,
+    # não a primeira. O aviso DEPARA_CONFLITO_MESMA_COMPETENCIA promete a
+    # PRIMEIRA — força aqui, espelhando o laço de resolvidas_por_valor acima.
+    for (h, f), (fin, gru) in primeira_regra_irresolvivel.items():
+        mask = (df["HISTORICO_2"] == h) & (df["FORNECEDOR"] == f)
+        df.loc[mask, "FINALIZACAO"] = fin
+        df.loc[mask, "GRUPO"] = gru
     colapsadas = antes - len(df)
     if colapsadas > 0:
         controls.add("T11/De-Para", "INFO", "DEPARA_COLAPSO_RECENCIA",
@@ -368,13 +478,15 @@ def prepare_depara_keys(df_depara: pd.DataFrame, controls: RunControls) -> pd.Da
                      f"recência (inclui regras idênticas repetidas entre competências).",
                      registros=int(colapsadas))
     log_step(logger, "R3", "De-Para resolvido: 1 regra por chave (recência)", df)
-    return df
+    # V3 — os dois conjuntos de chaves ambíguas seguem para a marcação por lançamento
+    return df, set(irresolviveis), set(resolvidas_por_valor.keys())
 
 
-def enrich_cobranca_with_depara(
-    df_cobranca_keys: pd.DataFrame,
-    df_depara_norm: pd.DataFrame,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def enrich_cobranca_with_depara(df_cobranca_keys: pd.DataFrame,
+                                df_depara_norm: pd.DataFrame,
+                                controls: RunControls,
+                                chaves_conflito: set,
+                                chaves_valor: set) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Tool 11 — join Cobrança (with normalized keys) × normalized De-Para.
 
@@ -383,6 +495,10 @@ def enrich_cobranca_with_depara(
     Returns:
         unmatched_cobranca (Tool 11 L) — go back to the main cascade via Tool 44
         matched_cobranca   (Tool 11 J) — continue to Tool 88 (manual overrides)
+
+    V3 (2026-07-27): recebe os conjuntos de chaves ambíguas que `prepare_depara_keys`
+    devolveu e registra a razão no LANÇAMENTO que casou com elas — antes o achado
+    existia só como total agregado no aviso.
     """
     l_out, j_out, _ = alteryx_join(
         df_cobranca_keys, df_depara_norm,
@@ -391,6 +507,21 @@ def enrich_cobranca_with_depara(
     )
     log_step(logger, "11L", "Cobrança unmatched in De-Para", l_out)
     log_step(logger, "11J", "Cobrança matched in De-Para", j_out)
+    # V3 — o lançamento que casou com uma chave ambígua do De-Para sai marcado.
+    # A chave do lado da base é [HISTORICO2, Nome do Fornecedor] (as colunas já
+    # normalizadas por prepare_cobranca_keys), na mesma ordem em que
+    # prepare_depara_keys montou os pares (HISTORICO_2, FORNECEDOR).
+    if len(j_out) > 0:
+        pares = list(zip(j_out["HISTORICO2"], j_out["Nome do Fornecedor"]))
+        for chaves, codigo in (
+            (chaves_conflito, "DEPARA_CONFLITO_MESMA_COMPETENCIA"),
+            (chaves_valor, "DEPARA_CONFLITO_RESOLVIDO_POR_VALOR"),
+        ):
+            if not chaves:
+                continue
+            mask = pd.Series([p in chaves for p in pares], index=j_out.index)
+            if mask.any():
+                controls.registra_razao(j_out.loc[mask, "ID Lançamento"], codigo)
     return l_out, j_out
 
 
@@ -410,6 +541,11 @@ def apply_manual_group_override(
         'REEMBOLSO' com só um warning no log);
       - o cadastro passa pelo mesmo padrão R2 (dedup se idêntico / erro se conflito).
 
+    V3 (2026-07-27) — GRUPO sem cadastro deixou de ser ERRO BLOQUEANTE: vira razão
+    `GRUPO_NAO_CADASTRADO` por ID Lançamento (WARNING) e o lançamento volta ao
+    base_final via `reconciliar_espinha` (Status CADASTRO_PENDENTE, Conta destino =
+    própria conta de origem), em vez de abortar a execução inteira.
+
     Conta destino for the Cobrança path is created HERE (not in a later formula):
     Tool 88's SelectConfiguration renames the override's Right_"Conta Contábil"
     → "Conta destino" and drops Right_"Grupo" / Right_"Conta OM" (XML line 2755).
@@ -428,12 +564,17 @@ def apply_manual_group_override(
     if len(l_out) > 0:
         faltantes = sorted(l_out["GRUPO"].dropna().unique().tolist())
         valor = float(l_out["Valor"].sum())
-        controls.erro(
-            "T88/Grupos", "GRUPO_NAO_CADASTRADO",
+        # V3 (2026-07-27) — deixou de ser ERRO bloqueante: o lançamento volta ao
+        # base_final via reconciliar_espinha, com Status CADASTRO_PENDENTE e a
+        # própria Conta Contábil como destino (D3/D6 do spec da v3).
+        controls.registra_razao(l_out["ID Lançamento"], "GRUPO_NAO_CADASTRADO")
+        controls.add(
+            "T88/Grupos", "WARNING", "GRUPO_NAO_CADASTRADO",
             f"{len(l_out):,} lançamento(s) de Cobrança (R$ {valor:,.2f}) têm GRUPO sem "
-            f"cadastro no De-Para de Grupos: {faltantes}. Adicione esses GRUPOs ao "
-            f"cadastro 'depara_grupos' (colunas Grupo · Conta OM · Conta Contábil) e "
-            f"re-execute — sem isso esses lançamentos sumiriam da base final.",
+            f"cadastro no De-Para de Grupos: {faltantes}. Eles entram na base final com "
+            f"Status 'CADASTRO_PENDENTE' e a própria conta de origem como destino. "
+            f"Adicione esses GRUPOs ao cadastro 'depara_grupos' (colunas Grupo · Conta "
+            f"OM · Conta Contábil) e re-execute para que sejam classificados.",
             registros=len(l_out), valor=valor)
 
     # Tool 88 select: rename override's "Conta Contábil" → "Conta destino", drop the
@@ -455,17 +596,29 @@ def consolidate_cobranca(df_cobranca_overridden: pd.DataFrame,
     """
     Tools 132 + 101 + 99.
 
-    V2: o colapso do dedup (duplicata exata) é medido e entra como termo da
-    equação de conservação (A1) — paridade Alteryx preservada.
+    V2: Tool 132 fazia dedup pelas 30 colunas do workflow (agia como DISTINCT) e
+    o colapso (duplicata exata) era medido como termo da equação de conservação
+    (A1) — paridade Alteryx preservada.
 
-    Tool 132: dedup by all 30 columns listed in the workflow (acts as DISTINCT).
-              "Conta destino" is already present at this point — it was created in
-              Tool 88 (apply_manual_group_override), matching the .yxmd GroupBy list.
+    V3 (2026-07-27): o drop_duplicates saiu. Tool 132 agora é só o SELECT das
+    mesmas colunas (mais "ID Lançamento", que precisa sobreviver ao select) —
+    nunca colapsa linhas. Ver comentário junto de `select_cols_t132` abaixo para o
+    racional. "Conta destino" já está presente aqui — foi criada no Tool 88
+    (apply_manual_group_override), casando com a lista GroupBy do .yxmd.
     Tool 101: add Tipo = "Cobrança".
     Tool 99 : drop helper columns (Conta GCUT, Pacote GCUT, HISTORICO2,
               Nome do Fornecedor, FINALIZACAO, GRUPO).
     """
-    dedup_cols = [
+    # V3 (2026-07-27) — o Tool 132 continua sendo o SELECT de colunas do Alteryx,
+    # mas o drop_duplicates saiu. Racional (spec da v3 §8): depois do R3 (De-Para
+    # resolvido para 1 regra por chave) e do R2 (Estrutura deduplicada na leitura),
+    # as duas fontes conhecidas de clone estão fechadas a montante — o dedup aqui
+    # só conseguiria apagar duplicata NATIVA da base, que é lançamento real. Se um
+    # clone aparecer, ele sobrevive até o censo (controls.censo_final), que acusa
+    # DUPLICACAO_FABRICADA e manda corrigir o input.
+    # Nome era `dedup_cols` na v2; virou só a lista do SELECT quando o dedup saiu.
+    select_cols_t132 = [
+        "ID Lançamento",
         "Codigo Interno", "Mes", "Data", "Grupo Acionista", "Plano de Contas Original",
         "Grupo Conta", "Conta Contabil", "Conta BRGaap", "Nome da Conta", "Valor",
         "Historico", "Fornecedor", "Veiculo Legal", "Centro de Custo",
@@ -474,20 +627,12 @@ def consolidate_cobranca(df_cobranca_overridden: pd.DataFrame,
         "Classificacao", "Cont.Doc", "Conta GCUT", "Pacote GCUT", "HISTORICO2",
         "Nome do Fornecedor", "FINALIZACAO", "GRUPO", "Conta destino",
     ]
-    existing = [c for c in dedup_cols if c in df_cobranca_overridden.columns]
-    valor_antes = float(df_cobranca_overridden["Valor"].sum()) if len(df_cobranca_overridden) else 0.0
-    df = df_cobranca_overridden[existing].drop_duplicates().copy()
-    log_step(logger, "132", "Cobrança consolidated (dedup incl. Conta destino)", df)
+    existing = [c for c in select_cols_t132 if c in df_cobranca_overridden.columns]
+    df = df_cobranca_overridden[existing].copy()
+    log_step(logger, "132", "Cobrança select (V3: sem dedup)", df)
 
-    # V2/A1 — termo 'colapso T132' da equação de conservação (paridade Alteryx)
-    colapsadas = len(df_cobranca_overridden) - len(df)
-    valor_colapsado = valor_antes - (float(df["Valor"].sum()) if len(df) else 0.0)
-    controls.registra_termo("colapso_t132", colapsadas, valor_colapsado)
-    if colapsadas > 0:
-        controls.add("T132/Cobrança", "INFO", "DUPLICATA_EXATA_COLAPSADA",
-                     f"{colapsadas:,} linha(s) exatamente idênticas no caminho Cobrança "
-                     f"foram consolidadas em uma (comportamento herdado do Alteryx).",
-                     registros=colapsadas, valor=valor_colapsado)
+    # V3 — o termo continua existindo no resumo do log, sempre zerado
+    controls.registra_termo("colapso_t132", 0, 0.0)
 
     df["Tipo"] = "Cobrança"   # Tool 101
     log_step(logger, "101", "Cobrança: assign Tipo", df)
@@ -702,6 +847,40 @@ def finalize_arbitrado(df_matched: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def mascaras_cruzamento_familia(
+    conta_origem: pd.Series,
+    conta_destino: pd.Series,
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    Regra de família de prefixo de Conta Contábil — FONTE ÚNICA (v3.1, 2026-07-30).
+
+    Recebe as duas Series de conta JÁ COAGIDAS para string (coerce_conta_str no
+    chamador) e devolve as duas máscaras separadas:
+
+      r9a: prefixo de 3 dígitos 818 cruzando com {817, 819}. 817 e 819 são a
+        MESMA família (não cruzam entre si); 818 é família separada.
+      r9b: 1º dígito 8 cruzando com não-8, excluindo as linhas já capturadas
+        por r9a (o 8 separa uma família maior que engloba 817/818/819).
+
+    Por que a função existe: a regra é consumida por dois controles — R10
+    (autocorrigir_conta_om, decide se vale reescrever a Conta destino do
+    lançamento automaticamente) e R9 (marcar_bloqueio_prefixo, decide se marca
+    Status=DESTINO_SUSPEITO). R9 precisa das duas máscaras separadas para
+    diferenciar os códigos PREFIXO_818_CRUZADO / PREFIXO_FAMILIA_8_CRUZADO; R10
+    só precisa saber se há violação (r9a | r9b). Antes desta função a regra
+    estava copiada literalmente nas duas funções — risco de discordância
+    silenciosa se alguém alterasse uma cópia e esquecesse a outra (pior caso:
+    R10 mais permissivo que R9, reescrevendo uma conta que R9 marcaria como
+    suspeita). O dicionário de família é config.FAMILIA_PREFIXO_CONTA — também
+    fonte única, não redeclarar aqui.
+    """
+    fam_o = conta_origem.str[:3].map(FAMILIA_PREFIXO_CONTA)
+    fam_d = conta_destino.str[:3].map(FAMILIA_PREFIXO_CONTA)
+    r9a = fam_o.notna() & fam_d.notna() & (fam_o != fam_d)
+    r9b = ((conta_origem.str[:1] == "8") != (conta_destino.str[:1] == "8")) & ~r9a
+    return r9a, r9b
+
+
 def autocorrigir_conta_om(
     df: pd.DataFrame,
     df_estrutura: pd.DataFrame,
@@ -714,7 +893,7 @@ def autocorrigir_conta_om(
     estar desatualizada) e reescreve só o Conta destino DESSA linha se achar.
     Nunca muda nenhum cadastro (Único CV, Estrutura, depara_grupos) — a
     correção é sempre por lançamento. Chamada 1x por Tipo (Arbitrado,
-    Reclassificador), ANTES de split_bloqueio_prefixo.
+    Reclassificador), ANTES de marcar_bloqueio_prefixo.
 
     Por que reescrever a conta do lançamento (não o cadastro): o papel do
     Único CV é só forçar que a Classe de Valor caia numa Conta OM determinada
@@ -737,26 +916,26 @@ def autocorrigir_conta_om(
       df — mesmo DataFrame de entrada, com Conta destino reescrita nas linhas
         corrigidas e uma coluna interna '_conta_om_destino' preenchida em toda
         linha que violava a família (corrigida ou não — reaproveitada por
-        split_bloqueio_prefixo pra montar a orientação sem recalcular).
-      correcoes — 1 linha por correção feita: Codigo Interno · Tipo · Nome da
-        Classe de Valor · Valor · Conta destino original · Conta destino
-        corrigida · Conta OM (vazio se nada foi corrigido).
+        marcar_bloqueio_prefixo pra montar a orientação sem recalcular).
+      correcoes — 1 linha por correção feita: Codigo Interno · Tipo ·
+        Nome da Classe de Valor · Valor · Conta destino original ·
+        Conta destino corrigida · Conta OM (vazio se nada foi corrigido).
+        Schema de 7 colunas = SCHEMA_OUTPUT.md §3 — 'ID Lançamento' NÃO entra
+        aqui. Os IDs corrigidos são coletados numa lista local (não a partir
+        do DataFrame de retorno) só p/ alimentar controls.registra_razao
+        (V3), pra não alargar o schema documentado por conveniência interna.
     """
     cc = coerce_conta_str(df["Conta Contabil"])
     cd_original = coerce_conta_str(df["Conta destino"])
 
-    familia_818 = {"817": "817/819", "819": "817/819", "818": "818"}
-    fam_o_818 = cc.str[:3].map(familia_818)
-    fam_d_818 = cd_original.str[:3].map(familia_818)
-    r9a = fam_o_818.notna() & fam_d_818.notna() & (fam_o_818 != fam_d_818)
-    r9b = ((cc.str[:1] == "8") != (cd_original.str[:1] == "8")) & ~r9a
+    r9a, r9b = mascaras_cruzamento_familia(cc, cd_original)
     violacao = r9a | r9b
 
     df = df.copy()
     df["_conta_om_destino"] = pd.NA
 
-    cols_correcao = ["Codigo Interno", "Tipo", "Nome da Classe de Valor", "Valor",
-                     "Conta destino original", "Conta destino corrigida", "Conta OM"]
+    cols_correcao = ["Codigo Interno", "Tipo", "Nome da Classe de Valor",
+                     "Valor", "Conta destino original", "Conta destino corrigida", "Conta OM"]
 
     if not violacao.any():
         return df, pd.DataFrame(columns=cols_correcao)
@@ -778,6 +957,7 @@ def autocorrigir_conta_om(
         contas_por_conta_om.setdefault(conta_om, []).append(chave)
 
     correcoes = []
+    ids_corrigidos = []  # lista local — nao vem do DataFrame de retorno (schema §3)
     for idx in df.index[violacao]:
         destino_atual = cd_original.loc[idx]
         conta_om = conta_para_conta_om.get(destino_atual)
@@ -786,10 +966,10 @@ def autocorrigir_conta_om(
             continue  # conta destino não está na Estrutura — nada a fazer aqui
         origem = cc.loc[idx]
         if r9a.loc[idx]:
-            familia_necessaria = familia_818.get(origem[:3])
+            familia_necessaria = FAMILIA_PREFIXO_CONTA.get(origem[:3])
             candidato = next(
                 (c for c in contas_por_conta_om.get(conta_om, [])
-                 if familia_818.get(c[:3]) == familia_necessaria),
+                 if FAMILIA_PREFIXO_CONTA.get(c[:3]) == familia_necessaria),
                 None)
         else:
             precisa_comecar_com_8 = origem[:1] == "8"
@@ -799,6 +979,7 @@ def autocorrigir_conta_om(
                 None)
         if candidato is not None and candidato != destino_atual:
             df.loc[idx, "Conta destino"] = candidato
+            ids_corrigidos.append(df.loc[idx, "ID Lançamento"])
             correcoes.append({
                 "Codigo Interno": df.loc[idx, "Codigo Interno"],
                 "Tipo": df.loc[idx, "Tipo"],
@@ -812,6 +993,11 @@ def autocorrigir_conta_om(
     df_correcoes = pd.DataFrame(correcoes, columns=cols_correcao)
 
     if len(df_correcoes) > 0:
+        # V3 — fica registrado no próprio lançamento (Status OK, Motivo informativo).
+        # ids_corrigidos vem da lista local coletada no loop acima, nao de
+        # df_correcoes["ID Lançamento"] — essa coluna foi tirada do retorno pra
+        # nao alargar o schema documentado em SCHEMA_OUTPUT.md §3 (ver docstring).
+        controls.registra_razao(ids_corrigidos, "PREFIXO_CORRIGIDO_AUTOMATICAMENTE")
         controls.add(
             "R10/AutoCorrecao", "INFO", "PREFIXO_CORRIGIDO_AUTOMATICAMENTE",
             f"{len(df_correcoes):,} lançamento(s) tiveram a Conta destino "
@@ -824,61 +1010,55 @@ def autocorrigir_conta_om(
     return df, df_correcoes
 
 
-def split_bloqueio_prefixo(
+def marcar_bloqueio_prefixo(
     df: pd.DataFrame,
     controls: RunControls,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    V2/R9 (decisão dono 2026-07-20) — separa um DataFrame já finalizado de estágio
-    (com 'Conta Contabil', 'Conta destino', 'Tipo', 'Valor' preenchidos) em
-    (aprovados, bloqueados), aplicando duas regras de família de prefixo. Usada só
-    nos Tipos onde a conta final vem de um mecanismo NÃO-determinístico — Arbitrado
-    classe (match só por nome de Classe de Valor) e Reclassificador (predição de
-    ML) — chamada 1x por Tipo em pipeline.py, DEPOIS de autocorrigir_conta_om
-    (V2/R10) — então `bloqueados` aqui já é só o residual que não teve correção
-    automática possível. Cobrança e Consultorias ficam de fora (destino vem de
-    regra de negócio deliberada — depara_grupos curado à mão / conta hardcoded —
-    não de fallback; bloquear marcaria roteamento intencional como erro).
+    V2/R9 (dono 2026-07-20), reescrita na V3 (dono 2026-07-27).
 
-      R9a: prefixo de 3 dígitos 818 cruzando com {817, 819} (qualquer direção)
-           → 'PREFIXO_818_BLOQUEADO'
-      R9b: 1º dígito 8 cruzando com não-8 (qualquer direção)
-           → 'PREFIXO_FAMILIA_8_BLOQUEADO' (linha já pega pelo R9a nunca dispara
-             aqui — R9a exige que os dois lados comecem com 8, então já é
-             subconjunto de "os dois começam com 8"; a linha abaixo deixa isso
-             explícito no código em vez de deixar implícito)
+    Aplica as duas regras de família de prefixo a um DataFrame já finalizado de
+    estágio (com 'Conta Contabil', 'Conta destino', 'Tipo', 'Valor'), usada só nos
+    Tipos onde a conta final vem de mecanismo NÃO-determinístico — Arbitrado classe
+    e Reclassificador — chamada 1x por Tipo em pipeline.py, DEPOIS de
+    autocorrigir_conta_om (V2/R10). Cobrança e Consultorias ficam de fora (destino
+    vem de regra de negócio deliberada, não de fallback).
 
-    817 e 819 são a MESMA família (não bloqueiam entre si — ficam aprovados; o
-    WARNING de visibilidade pra esse caso é feature futura, fora deste escopo).
+      R9a: prefixo de 3 dígitos 818 cruzando com {817, 819} → 'PREFIXO_818_CRUZADO'
+      R9b: 1º dígito 8 cruzando com não-8                   → 'PREFIXO_FAMILIA_8_CRUZADO'
 
-    V2/R10 (decisão dono 2026-07-21): `bloqueados` ganha 'Conta OM' (lida da
-    coluna interna '_conta_om_destino', se presente — populada por
-    autocorrigir_conta_om; se ausente, fica NA, sem quebrar) e 'Ação
-    Recomendada' — texto por Tipo: Arbitrado classe orienta cadastro de conta
-    na Conta OM certa; Reclassificador orienta revisão manual (não há cadastro
-    direto a corrigir num caminho de predição de ML).
+    Regra de família (817/819 mesma família, 818 separada, 1º dígito 8 separa a
+    família maior) — ver mascaras_cruzamento_familia(), fonte única desde a
+    v3.1 (2026-07-30), para o texto completo e o racional de ela ser função
+    compartilhada com o R10.
+
+    **Mudança da V3:** a função não tira mais ninguém do fluxo. Ela MARCA (registra a
+    razão por ID no RunControls, com ação recomendada específica por lançamento) e
+    devolve o DataFrame inteiro. O lançamento segue com a `Conta destino` que cruza
+    família (decisão D4 — o antigo campo de modo warning do R9 virou o comportamento único).
+    O segundo retorno continua alimentando a aba 'Bloqueio Prefixo Conta' do excel.
+
+    Nome antigo: `split_bloqueio_prefixo` (a coluna interna chamava-se `Motivo`, que
+    na V3 passou a ser coluna de saída do base_final — por isso o `_motivo_r9`).
     """
     cc = coerce_conta_str(df["Conta Contabil"])
     cd = coerce_conta_str(df["Conta destino"])
 
-    familia_818 = {"817": "817/819", "819": "817/819", "818": "818"}
-    fam_o = cc.str[:3].map(familia_818)
-    fam_d = cd.str[:3].map(familia_818)
-    r9a = fam_o.notna() & fam_d.notna() & (fam_o != fam_d)
+    r9a, r9b = mascaras_cruzamento_familia(cc, cd)
 
-    r9b = ((cc.str[:1] == "8") != (cd.str[:1] == "8")) & ~r9a
+    marcado = df.copy()
+    marcado["_motivo_r9"] = pd.NA
+    marcado.loc[r9a, "_motivo_r9"] = "PREFIXO_818_CRUZADO"
+    marcado.loc[r9b, "_motivo_r9"] = "PREFIXO_FAMILIA_8_CRUZADO"
 
-    df = df.copy()
-    df["Motivo"] = pd.NA
-    df.loc[r9a, "Motivo"] = "PREFIXO_818_BLOQUEADO"
-    df.loc[r9b, "Motivo"] = "PREFIXO_FAMILIA_8_BLOQUEADO"
+    bloqueados = marcado[marcado["_motivo_r9"].notna()].copy()
 
-    bloqueados = df[df["Motivo"].notna()].copy()
-    aprovados = df[df["Motivo"].isna()].drop(columns=["Motivo"]).copy()
-    if "_conta_om_destino" in aprovados.columns:
-        aprovados = aprovados.drop(columns=["_conta_om_destino"])
+    # o fluxo segue com TODAS as linhas, sem colunas internas
+    completo = marcado.drop(columns=[c for c in ("_motivo_r9", "_conta_om_destino")
+                                     if c in marcado.columns])
 
     if len(bloqueados) > 0:
+        bloqueados = bloqueados.rename(columns={"_motivo_r9": "Motivo"})
         if "_conta_om_destino" in bloqueados.columns:
             bloqueados["Conta OM"] = bloqueados["_conta_om_destino"]
             bloqueados = bloqueados.drop(columns=["_conta_om_destino"])
@@ -892,7 +1072,7 @@ def split_bloqueio_prefixo(
                         f"necessária cadastrada.")
             origem_pref3 = str(row["Conta Contabil"])[:3]
             origem_pref1 = str(row["Conta Contabil"])[:1]
-            if row["Motivo"] == "PREFIXO_818_BLOQUEADO":
+            if row["Motivo"] == "PREFIXO_818_CRUZADO":
                 falta = "818" if origem_pref3 == "818" else "817 ou 819"
             else:
                 falta = "que comece com 8" if origem_pref1 == "8" else "que NÃO comece com 8"
@@ -901,67 +1081,28 @@ def split_bloqueio_prefixo(
 
         bloqueados["Ação Recomendada"] = bloqueados.apply(_acao_recomendada, axis=1)
 
-    for codigo, descricao in (
-        ("PREFIXO_818_BLOQUEADO", "prefixo 818 cruzando com 817/819"),
-        ("PREFIXO_FAMILIA_8_BLOQUEADO", "prefixo 8 cruzando com não-8"),
-    ):
-        sub = bloqueados[bloqueados["Motivo"] == codigo]
-        if len(sub) == 0:
-            continue
-        controls.add(
-            "R9/Prefixo", "WARNING", codigo,
-            f"{len(sub):,} lançamento(s) bloqueados por cruzamento de prefixo de "
-            f"Conta Contábil ({descricao}) — detalhe na aba 'Bloqueio Prefixo Conta' "
-            f"do relatório de exceções, com a ação recomendada por lançamento.",
-            registros=int(len(sub)), valor=float(sub["Valor"].sum()))
+        # V3 — razão por lançamento, com a ação específica (Conta OM daquela linha)
+        for codigo in ("PREFIXO_818_CRUZADO", "PREFIXO_FAMILIA_8_CRUZADO"):
+            sub = bloqueados[bloqueados["Motivo"] == codigo]
+            if len(sub) == 0:
+                continue
+            controls.registra_razao(
+                sub["ID Lançamento"], codigo,
+                acoes=dict(zip(sub["ID Lançamento"],
+                               sub["Ação Recomendada"])))
+            descricao = ("prefixo 818 cruzando com 817/819" if codigo == "PREFIXO_818_CRUZADO"
+                         else "prefixo 8 cruzando com não-8")
+            controls.add(
+                "R9/Prefixo", "WARNING", codigo,
+                f"{len(sub):,} lançamento(s) com cruzamento de prefixo de Conta Contábil "
+                f"({descricao}). Eles ENTRAM na base final com Status "
+                f"'DESTINO_SUSPEITO' e a conta que cruza — filtre por Status antes de "
+                f"carregar. Detalhe na aba 'Bloqueio Prefixo Conta' do relatório de "
+                f"exceções, com a ação recomendada por lançamento.",
+                registros=int(len(sub)), valor=float(sub["Valor"].sum()))
 
-    log_step(logger, "R9", "Bloqueio de prefixo de Conta (aprovados)", aprovados)
-    return aprovados, bloqueados
-
-
-def aplicar_modo_r9(
-    aprovados: pd.DataFrame,
-    bloqueados: pd.DataFrame,
-    modo_warning: bool,
-    controls: RunControls,
-) -> Tuple[pd.DataFrame, Tuple[int, float]]:
-    """
-    V2/R10 (decisão dono 2026-07-21) — decide o destino do residual que
-    split_bloqueio_prefixo não conseguiu resolver, conforme o modo configurado
-    no PPR (parâmetro `modo_r9_warning` de pipeline.run_pipeline(), default
-    False = bloqueia, preserva o comportamento já validado do R9):
-
-      modo_warning=False (default): aprovados fica como está; bloqueados sai
-        do base_final (termo de conservação = tamanho/valor de bloqueados).
-      modo_warning=True: bloqueados volta pro fluxo normal (recombinado em
-        aprovados, sem as colunas Motivo/Conta OM/Ação Recomendada — essas só
-        existem no relatório de exceções, nunca no base_final); termo de
-        conservação = (0, 0.0), porque nada foi de fato excluído. Dispara um
-        aviso INFO avisando que o modo está ativo.
-
-    A aba de exceção e os avisos WARNING agregados de split_bloqueio_prefixo
-    já dispararam ANTES desta função rodar, nos dois modos — só o que
-    acontece com o base_final muda.
-    """
-    if len(bloqueados) == 0:
-        return aprovados, (0, 0.0)
-
-    if not modo_warning:
-        return aprovados, (len(bloqueados), float(bloqueados["Valor"].sum()))
-
-    cols_extra = [c for c in ("Motivo", "Conta OM", "Ação Recomendada")
-                  if c in bloqueados.columns]
-    bloqueados_sem_marcacao = bloqueados.drop(columns=cols_extra)
-    aprovados_final = pd.concat([aprovados, bloqueados_sem_marcacao],
-                                ignore_index=True, sort=False)
-    controls.add(
-        "R9/Prefixo", "INFO", "PREFIXO_MODO_WARNING_ATIVO",
-        f"Modo warning do R9 está ativo — {len(bloqueados):,} lançamento(s) "
-        f"(R$ {float(bloqueados['Valor'].sum()):,.2f}) que cruzaram família de "
-        f"prefixo NÃO foram excluídos do base_final (ficaram só sinalizados; "
-        f"ver aba 'Bloqueio Prefixo Conta').",
-        registros=len(bloqueados), valor=float(bloqueados["Valor"].sum()))
-    return aprovados_final, (0, 0.0)
+    log_step(logger, "R9", "Marcação de cruzamento de prefixo (fluxo completo)", completo)
+    return completo, bloqueados
 
 
 # =========================================================================
@@ -1074,6 +1215,11 @@ def integrate_reclassified(
         r_out["Conta destino"] = coerce_conta_str(r_out["Conta Contabil"])  # V2/N1
         # V2/E — fallback silencioso na v1: agora o usuário vê quantos lançamentos o
         # reclassificador não cobriu (ficaram com a própria conta de origem)
+        # Correção 2 (2026-07-28) — razão por lançamento (Status DESTINO_SUSPEITO):
+        # o código já existia no CATALOGO_RAZOES e no spec, mas nenhum
+        # registra_razao o emitia — os lançamentos do fallback saíam do base_final
+        # sem o Motivo, contra o spec.
+        controls.registra_razao(r_out["ID Lançamento"], "RECLASSIFICADOR_FALLBACK")
         controls.add("T126/Reclassificador", "WARNING", "RECLASSIFICADOR_FALLBACK",
                      f"{len(r_out):,} lançamento(s) enviados ao Reclassificador não vieram "
                      f"no retorno — mantiveram a própria Conta Contábil como destino.",
@@ -1135,16 +1281,159 @@ def final_union(
     return df
 
 
-def build_final_consolidated(df_unioned: pd.DataFrame,
-                             controls: RunControls) -> pd.DataFrame:
+# =========================================================================
+# V3 (2026-07-27) — RECONCILIAÇÃO DA ESPINHA
+# Spec: docs/superpowers/specs/2026-07-27-v3-base-final-completa-design.md §6
+# =========================================================================
+def reconciliar_espinha(df_base: pd.DataFrame,
+                        df_unioned: pd.DataFrame,
+                        controls: RunControls) -> pd.DataFrame:
+    """V3 — devolve o UNIVERSO COMPLETO da base de fechamento, marcado.
+
+    A base bruta (espinha) é a saída; o union da cascata só diz o que aconteceu
+    com cada lançamento. Quem voltou da cascata entra com o que a cascata
+    calculou; quem não voltou entra com `Conta destino` = `Conta Contabil`
+    (decisão D3 — nenhuma reclassificação é inventada) e `Tipo` =
+    "Não classificado".
+
+    Lançamento que sumiu SEM razão registrada por nenhum stage é bug de
+    orquestração — é a rede de segurança que impede um stage futuro de perder
+    linha em silêncio. V3.1 (2026-07-29): esse caso PAROU de abortar a rodada.
+    A linha volta à base com a conta de ORIGEM como `Conta destino` (valor
+    conservado) e `Status = FALHA_INTERNA`; o evento sai como WARNING
+    `PERDA_NAO_EXPLICADA` (não ERRO — o invariante "severidade ERRO sempre
+    aborta a rodada" continua valendo). O objetivo é que o mês possa ser
+    carregado mesmo quando a própria ferramenta falha, com a linha visível e
+    auditável na base final em vez de a rodada morrer sem entregar nada.
+
+    Simetricamente, um ID que aparece na união e NÃO existe na espinha
+    (`CONSERVACAO_VIOLADA`) continua sendo outro bug de orquestração — e esse
+    ramo CONTINUA bloqueante (ERRO, aborta a rodada): a conservação vale nos
+    dois sentidos, mas só o sentido "sumiu" ganhou a rede de segurança nova.
     """
-    Tools 110 + 113 + 111 + 115 + 114 — apply Record IDs, build ERP keys,
-    format date, and select final schema.
+    if len(df_base) == 0:
+        raise RuntimeError(
+            "reconciliar_espinha recebeu df_base vazio — bug de orquestração "
+            "(o pipeline já deveria ter bloqueado em BASE_VAZIA antes de chegar aqui).")
+    if df_base["ID Lançamento"].isna().any():
+        raise RuntimeError(
+            "reconciliar_espinha recebeu 'ID Lançamento' nulo na espinha — bug de "
+            "orquestração (a coluna é gerada pelo próprio read_base_fechamento; "
+            "nulo ali não é input sujo, é bug interno).")
+    # A união também: um ID nulo vindo de lá (stage que o perdeu num outer join)
+    # cairia em `sobrando` e estouraria ValueError cru DENTRO da montagem da
+    # mensagem de CONSERVACAO_VIOLADA — o bloqueio acionável nunca sairia.
+    if len(df_unioned) > 0 and df_unioned["ID Lançamento"].isna().any():
+        raise RuntimeError(
+            "reconciliar_espinha recebeu 'ID Lançamento' nulo na união final — bug de "
+            "orquestração (algum stage perdeu o ID no caminho; a coluna viaja da "
+            "espinha e não pode ser nula).")
+
+    ids_base = df_base["ID Lançamento"]
+    ids_union = df_unioned["ID Lançamento"] if len(df_unioned) else pd.Series([], dtype="int64")
+
+    faltantes = df_base[~ids_base.isin(ids_union)].copy()
+
+    ids_faltantes = [int(i) for i in faltantes["ID Lançamento"]]
+    codigos = controls.codigos_por_id()
+    # V3.1 — isenção estreitada: só os 3 códigos que de fato REMOVEM o lançamento
+    # explicam a ausência. Razão informativa é registrada em linha que SEGUE no
+    # fluxo, então se essa linha sumiu, é defeito do motor e a rede tem de pegar.
+    sem_razao = [
+        i for i in ids_faltantes
+        if not (set(codigos.get(i, ())) & CODIGOS_QUE_REMOVEM_LANCAMENTO)
+    ]
+    if sem_razao:
+        exemplos = ", ".join(str(i) for i in sem_razao[:10])
+        valor = float(faltantes.loc[faltantes["ID Lançamento"].isin(sem_razao), "Valor"].sum())
+        # V3.1 (dono, 2026-07-29) — deixou de abortar. Era o ÚNICO código bloqueante
+        # que o usuário não tinha como resolver: todos os outros nomeiam um input a
+        # corrigir, este diz "o motor perdeu uma linha", e o mês não saía. Agora o
+        # lançamento volta com a conta de origem (valor conservado, base carregável)
+        # marcado com Status FALHA_INTERNA, e o evento fica no log/aba Avisos/tabela
+        # warnings para auditoria da ferramenta. Severidade WARNING de propósito: o
+        # invariante "severidade ERRO sempre aborta a rodada" continua valendo.
+        controls.registra_razao(sem_razao, "PERDA_NAO_EXPLICADA")
+        controls.add(
+            "V3/Reconciliação", "WARNING", "PERDA_NAO_EXPLICADA",
+            f"{len(sem_razao):,} lançamento(s) (R$ {valor:,.2f}) sumiram do tratamento "
+            f"sem que nenhuma etapa registrasse o motivo. Isso é falha da própria "
+            f"ferramenta, não do arquivo enviado: eles voltaram à base com a conta de "
+            f"origem e Status 'FALHA_INTERNA'. NÃO carregue essas linhas e avise o time "
+            f"responsável pela ferramenta. ID Lançamento (até 10): {exemplos}",
+            registros=len(sem_razao), valor=valor)
+
+    if len(df_unioned) > 0:
+        sobrando = df_unioned[~df_unioned["ID Lançamento"].isin(ids_base)]
+        if len(sobrando) > 0:
+            exemplos = ", ".join(str(int(i)) for i in sobrando["ID Lançamento"].head(10))
+            valor = float(sobrando["Valor"].sum())
+            controls.erro(
+                "V3/Reconciliação", "CONSERVACAO_VIOLADA",
+                f"{len(sobrando):,} lançamento(s) (R$ {valor:,.2f}) apareceram na saída da "
+                f"cascata sem existir na Base de Fechamento. Isso é falha do próprio "
+                f"motor, não do input — a base_final NÃO deve ser usada. "
+                f"ID Lançamento (até 10): {exemplos}",
+                registros=len(sobrando), valor=valor)
+
+    if len(faltantes) > 0:
+        faltantes["Conta destino"] = coerce_conta_str(faltantes["Conta Contabil"])
+        faltantes["Tipo"] = "Não classificado"
+
+    partes = [p for p in (df_unioned, faltantes) if len(p) > 0]
+    completa = pd.concat(partes, ignore_index=True, sort=False)
+    completa = completa.sort_values("ID Lançamento", kind="stable").reset_index(drop=True)
+
+    sem_razao_default = (STATUS_OK, "", "")
+
+    # V3.1 (Correção 2) — leitura ÚNICA e INCONDICIONAL do snapshot, feita aqui,
+    # imediatamente antes da estampagem: tem de ser POSTERIOR a toda e qualquer
+    # chamada de `controls.registra_razao` desta função (ex.: PERDA_NAO_EXPLICADA
+    # acima), senão as linhas marcadas depois do snapshot saem com Status/Motivo/
+    # Ação vazios em silêncio — esse bug já aconteceu neste projeto (Task 9 da v3,
+    # quando a leitura antecipada não era relida após uma razão nova).
+    marcacao = controls.marcacao_por_id()
+    # Correção 3: uma unica passada resolve a tupla (Status, Motivo, Acao) por ID e
+    # expande nas 3 colunas de uma vez, em vez de 3 .map() repetindo o mesmo lookup.
+    tuplas = [marcacao.get(int(i), sem_razao_default) for i in completa["ID Lançamento"]]
+    completa[["Status", "Motivo", "Ação Recomendada"]] = pd.DataFrame(
+        tuplas, columns=["Status", "Motivo", "Ação Recomendada"], index=completa.index)
+
+    logger.info(f"[V3] Espinha reconciliada (universo completo): "
+                f"{len(completa):,} lançamentos.")
+    n_marcados = int((completa["Status"] != STATUS_OK).sum())
+    logger.info(f"[V3] {len(completa):,} lançamentos na base completa; "
+                f"{n_marcados:,} com Status != OK.")
+    return completa
+
+
+def build_final_consolidated(df_completa: pd.DataFrame,
+                             controls: RunControls) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Tools 110 + 113 + 111 + 115 + 114 — Record IDs, chaves ERP, data e select final.
+
+    V3 (2026-07-27): recebe a ESPINHA RECONCILIADA (universo completo), não o union.
+    O `cumcount` do Tool 110 passa a rodar sobre a base completa ordenada por
+    `ID Lançamento`, então o sufixo `_N` do Índice ERP volta a significar só
+    duplicata NATIVA. Devolve (aba1, aba2): aba1 = universo gerencial, aba2 =
+    lançamentos de Classe de Valor excluída (Status FORA_DE_ESCOPO).
 
     V2/D5: datas de `Mes` que o parser não entende viravam DateTime_Out vazio em
-    SILÊNCIO (errors="coerce") — agora: coluna 100% inválida = ERRO; parcial = WARNING.
+    SILÊNCIO (errors="coerce"); a v2 fazia ERRO se 100% inválido, WARNING se parcial.
+    V3/D6: nunca bloqueia — os dois casos são o MESMO aviso (WARNING `MES_INVALIDO`),
+    e cada lançamento com `Mes` inválido leva a razão `MES_INVALIDO` (Status
+    DADO_INVALIDO) para a base final, com DateTime_Out vazio.
+
+    V3 (2026-07-28, Correção 1): a VALIDAÇÃO de 'Mes' (registra_razao +
+    controls.add do WARNING `MES_INVALIDO`) saiu daqui — mora agora em
+    `validar_mes`, chamada ANTES de `reconciliar_espinha` (ver docstring de lá
+    pro racional). Esta função só FORMATA (converte de novo, idempotente, e
+    escreve `DateTime_Out`) — por isso `controls` deixou de ser usado no corpo,
+    mas o parâmetro fica na assinatura (reservado: pipeline.py e outras tasks
+    chamam esta função com `controls`; não é usado aqui, mas remover quebraria
+    o contrato de chamada).
     """
-    df = df_unioned.copy()
+    df = df_completa.copy()
 
     # Tool 110 — RecordID grouped by Codigo Interno, starting at 0
     df["RecordID"] = df.groupby("Codigo Interno").cumcount()
@@ -1170,30 +1459,26 @@ def build_final_consolidated(df_unioned: pd.DataFrame,
 
     # Tool 115 — write the dd/MM/yyyy date into a NEW field "DateTime_Out" (Mes is preserved,
     # then dropped by the Tool 114 select). The exported column is named "DateTime_Out".
+    # V3 (2026-07-28, Correção 1) — a validação de 'Mes' (razão MES_INVALIDO) já rodou
+    # em `validar_mes`, antes de `reconciliar_espinha`; aqui é só a formatação de saída.
     mes_dt = pd.to_datetime(df["Mes"], errors="coerce")
-    n_invalidas = int(mes_dt.isna().sum())
-    if len(df) > 0 and n_invalidas == len(df):
-        controls.erro("T115/Datas", "MES_INVALIDO",
-                      f"NENHUM valor da coluna 'Mes' pôde ser interpretado como data "
-                      f"(exemplo: {df['Mes'].iloc[0]!r}) — a carga Matrix sairia sem data. "
-                      f"Verifique o formato da coluna na Base de Fechamento.",
-                      registros=n_invalidas)
-    elif n_invalidas > 0:
-        controls.add("T115/Datas", "WARNING", "MES_PARCIALMENTE_INVALIDO",
-                     f"{n_invalidas:,} lançamento(s) com 'Mes' inválido — DateTime_Out "
-                     f"sairá vazio nessas linhas da base final.",
-                     registros=n_invalidas)
     df["DateTime_Out"] = mes_dt.dt.strftime("%d/%m/%Y")
     log_step(logger, "115", "Format Mes → DateTime_Out (dd/MM/yyyy)", df)
 
-    # Tool 114 — final select
+    # Tool 114 — select final (V3: 19 colunas, as 15 originais + as 4 novas)
     keep = [c for c in FINAL_OUTPUT_SCHEMA if c in df.columns]
     missing = set(FINAL_OUTPUT_SCHEMA) - set(df.columns)
     if missing:
         logger.warning(f"[Tool 114] Missing columns in final schema: {missing}")
     df_out = df[keep].copy()
-    log_step(logger, "114", "Final consolidated schema", df_out)
-    return df_out
+
+    # V3 — split em 2 abas, ambas no mesmo schema de carga
+    fora = df_out["Status"] == STATUS_FORA_DE_ESCOPO
+    aba1 = df_out[~fora].reset_index(drop=True)
+    aba2 = df_out[fora].reset_index(drop=True)
+    log_step(logger, "114", "Final consolidated — aba 1 (universo gerencial)", aba1)
+    log_step(logger, "114", "Final consolidated — aba 2 (fora de escopo)", aba2)
+    return aba1, aba2
 
 
 # =========================================================================
@@ -1211,10 +1496,13 @@ def build_exceptions(dropped_contas, df_base_pos_t63, df_cc_cadastro,
         (o L do Tool 62 — exatamente as linhas hoje descartadas).
       - Centros de Custo (Tool 201): CCs presentes na base que NÃO existem no cadastro
         de Entidades x CC.
-      - Bloqueio Prefixo Conta (V2/R9, 2026-07-20): lançamentos de Arbitrado
+      - Bloqueio Prefixo Conta (V2/R9, 2026-07-20; comportamento de MARCAÇÃO
+        desde a reescrita V3 de 2026-07-27): lançamentos de Arbitrado
         classe/Reclassificador que cruzaram família de prefixo (818↔817/819 ou
-        8↔não-8) e foram excluídos do base_final — grão = 1 linha por lançamento
-        (diferente das duas outras abas, que agregam por código).
+        8↔não-8) — ficam no base_final com Status 'DESTINO_SUSPEITO' (NÃO são
+        mais excluídos; `marcar_bloqueio_prefixo` só marca e devolve o
+        DataFrame inteiro) — grão = 1 linha por lançamento (diferente das duas
+        outras abas, que agregam por código).
       - Correção Automática de Conta (V2/R10, 2026-07-21): lançamentos de
         Arbitrado classe/Reclassificador cuja Conta destino foi trocada
         automaticamente por uma conta compatível na MESMA Conta OM (sem
@@ -1256,10 +1544,14 @@ def build_exceptions(dropped_contas, df_base_pos_t63, df_cc_cadastro,
         cadastro = set(
             _normalize_join_key(df_cc_cadastro[CC_CADASTRO_CODE_COL]).dropna()
         )
-        base_cc = df_base_pos_t63[[BASE_CC_CODE_COL, BASE_CC_DESC_COL, "Valor"]].copy()
+        # V3 — 'ID Lançamento' entra no recorte para permitir a marcação por lançamento
+        # (a agregação abaixo é nomeada, então a coluna extra não muda `centros`).
+        base_cc = df_base_pos_t63[[BASE_CC_CODE_COL, BASE_CC_DESC_COL, "Valor",
+                                   "ID Lançamento"]].copy()
         code_norm = _normalize_join_key(base_cc[BASE_CC_CODE_COL])
         nao_encontrados = base_cc[~code_norm.isin(cadastro)]
         if len(nao_encontrados) > 0:
+            controls.registra_razao(nao_encontrados["ID Lançamento"], "CC_NAO_CADASTRADO")
             g = (nao_encontrados.groupby(BASE_CC_CODE_COL, dropna=False)
                                .agg(Descrição=(BASE_CC_DESC_COL, "first"),
                                     Valor=("Valor", "sum"))
@@ -1324,6 +1616,15 @@ def build_pacote_report(df_unioned: pd.DataFrame, df_estrutura: pd.DataFrame) ->
 
     Contas destino sem match na Estrutura (ex.: a conta hardcoda de Consultoria) e
     Pacotes em branco caem no bucket "(sem pacote)", para não perder Valor do total.
+
+    Correção 1 (2026-07-28) — 'Pacote GCUT' só nasce no rename do Tool 62
+    (`preprocess_base`), quando pelo menos uma linha casa na Estrutura de Contas.
+    Se a cascata inteira volta vazia (ex.: toda a base cai no filtro de Classe de
+    Valor excluída, ou nenhuma Conta Contabil casa na Estrutura), a base completa
+    devolvida por `reconciliar_espinha` não tem essa coluna — sem o guard abaixo,
+    o acesso direto a `df_unioned["Pacote GCUT"]` estoura KeyError. Ausência de
+    coluna é tratada como "todo mundo sem pacote de origem" — o mesmo destino que
+    o `.fillna` já dá pro valor nulo quando a coluna existe.
     """
     lookup = (
         df_estrutura[["CONTA CONTÁBIL", "PACOTE"]]
@@ -1335,7 +1636,10 @@ def build_pacote_report(df_unioned: pd.DataFrame, df_estrutura: pd.DataFrame) ->
     pacote_destino = (
         _normalize_join_key(df_unioned["Conta destino"]).map(lookup).fillna("(sem pacote)")
     )
-    pacote_origem = df_unioned["Pacote GCUT"].fillna("(sem pacote)")
+    if "Pacote GCUT" in df_unioned.columns:
+        pacote_origem = df_unioned["Pacote GCUT"].fillna("(sem pacote)")
+    else:
+        pacote_origem = pd.Series("(sem pacote)", index=df_unioned.index)
 
     antes = df_unioned.groupby(pacote_origem)["Valor"].sum()
     antes.index.name = "Pacote"

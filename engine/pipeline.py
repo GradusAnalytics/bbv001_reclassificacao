@@ -6,10 +6,17 @@ and writes both outputs (reclassifier input base + final consolidated base).
 
 V2 — por cima da topologia intacta, o pipeline agora carrega um RunControls
 (engine/controls.py) que: valida cadastros na entrada (R2/R4), faz o censo de
-duplicatas início×fim (R8, ERRO bloqueante), fecha a equação de conservação
-entrada×saída (A1, ERRO bloqueante) e coleta os avisos estruturados que o main()
-expõe ao usuário (aba 'Avisos' + tabela `warnings` + resumo no log).
-Racional: docs/SPEC_V2.md do projeto.
+duplicatas (R8, ERRO bloqueante), fecha a conservação entrada×saída (A1, ERRO
+bloqueante) e coleta os avisos estruturados que o main() expõe ao usuário (aba
+'Avisos' + tabela `warnings` + resumo no log). Racional: docs/SPEC_V2.md.
+
+V3 (2026-07-28) — nenhum lançamento é descartado: a saída é o universo completo da
+Base de Fechamento, marcado com Status/Motivo/Ação Recomendada. Os estágios
+continuam iguais, mas quem NÃO volta da cascata é reintegrado por
+`transforms.reconciliar_espinha`, e a conservação virou identidade de conjunto
+(`controls.verifica_conservacao(df_base, base_completa)`) em vez de soma de termos.
+A base final sai em 2 abas (universo gerencial + fora de escopo).
+Racional: docs/superpowers/specs/2026-07-27-v3-base-final-completa-design.md.
 """
 import logging
 
@@ -23,7 +30,7 @@ from controls import RunControls
 logger = logging.getLogger(__name__)
 
 
-def run_pipeline(base_reclassificada_override=None, modo_r9_warning: bool = False) -> dict:
+def run_pipeline(base_reclassificada_override=None) -> dict:
     """
     Execute the full pipeline.
 
@@ -32,20 +39,22 @@ def run_pipeline(base_reclassificada_override=None, modo_r9_warning: bool = Fals
     seus próprios arquivos default de modelo/parâmetros) e usa esse DataFrame
     diretamente — mantém o fluxo manual antigo como plano B.
 
-    modo_r9_warning: V2/R10 (decisão dono 2026-07-21) — default False (bloqueia,
-    preserva o comportamento já validado do R9). Se True, lançamentos que
-    cruzam família de prefixo e não têm correção automática possível (ver
-    autocorrigir_conta_om) sobem pro base_final com aviso em vez de serem
-    excluídos.
-
     Returns a dict of intermediate DataFrames for inspection/testing,
     plus paths to the two output files, plus (V2) `controls` com avisos/conservação.
 
-    Erros de negócio (input inválido, GRUPO não cadastrado, duplicação fabricada,
-    conservação violada) sobem como controls.BloqueioError com mensagem acionável.
+    Erros de negócio (input inválido, duplicação fabricada, conservação violada)
+    sobem como controls.BloqueioError com mensagem acionável.
+
+    V3 — ORDEM DE EXECUÇÃO É CONTRATO, não estilo: `reconciliar_espinha` tira o
+    SNAPSHOT de `controls.marcacao_por_id()` e estampa Status/Motivo/Ação
+    Recomendada na base final. Toda razão registrada (`controls.registra_razao`)
+    DEPOIS dela morre em silêncio. Por isso `validar_mes` roda no início, sobre a
+    base bruta, e `build_exceptions` (que registra CC_NAO_CADASTRADO) subiu para
+    antes da reconciliação. Ao acrescentar qualquer razão nova, confira o grep de
+    `registra_razao` contra esta ordem.
     """
     logger.info("=" * 70)
-    logger.info("BBV001 — RUNNING PIPELINE (v2)")
+    logger.info("BBV001 — RUNNING PIPELINE (v3)")
     logger.info("=" * 70)
 
     controls = RunControls()
@@ -68,15 +77,22 @@ def run_pipeline(base_reclassificada_override=None, modo_r9_warning: bool = Fals
                       "arquivo/aba corretos foram enviados.")
     controls.registra_termo("base_bruta", len(df_base), float(df_base["Valor"].sum()))
 
+    # V3 — 'Mes' inválido é propriedade da linha de ENTRADA e tem de ser marcado
+    # antes da reconciliação: reconciliar_espinha tira o snapshot da marcação e
+    # estampa as 3 colunas, então uma razão registrada depois dela morre no
+    # caminho. Foi exatamente o bug achado na revisão da Task 9 — o Status
+    # DADO_INVALIDO ficava inalcançável. Não mova esta chamada para depois.
+    t.validar_mes(df_base, controls)
+
     # -------------------------------------------------------------------
-    # STAGE 1 — PREPROCESS (V2: R1 + R2 + censo inicial R8 + termos A1)
+    # STAGE 1 — PREPROCESS (V2: R1 + R2 + termos A1; V3/R8: censo de duplicata
+    # NATIVA, informativo — o censo bloqueante roda no fim, por ID Lançamento)
+    # V3 — não há mais bloqueio BASE_VAZIA_POS_FILTROS: os filtros de entrada
+    # (T63/T62) deixaram de descartar lançamentos, só os marcam, e o universo da
+    # saída é a base BRUTA. Cascata vazia é um caso legítimo (tudo marcado), não
+    # um erro de input — a base vazia de verdade já bloqueou em BASE_VAZIA acima.
     # -------------------------------------------------------------------
     df_enriched, dropped_contas, df_pos_t63 = t.preprocess_base(df_base, df_estrutura, controls)
-    if len(df_enriched) == 0:
-        controls.erro("T62/Estrutura", "BASE_VAZIA_POS_FILTROS",
-                      "Nenhum lançamento restou após os filtros de entrada (Classes de "
-                      "Valor excluídas + match com a Estrutura de Contas). Verifique os "
-                      "arquivos enviados.")
 
     # V2/R5 — cobertura das Classes de Valor do mês (código→nome) contra o cadastro
     t.validar_cobertura_classe_valor(df_pos_t63, df_class, df_unico_cv, controls)
@@ -87,8 +103,12 @@ def run_pipeline(base_reclassificada_override=None, modo_r9_warning: bool = Fals
     nao_cobranca, cobranca = t.split_cobranca(df_enriched)
 
     cobranca_keys     = t.prepare_cobranca_keys(cobranca)
-    depara_norm       = t.prepare_depara_keys(df_depara, controls)
-    cob_unmatched, cob_matched = t.enrich_cobranca_with_depara(cobranca_keys, depara_norm)
+    # V3 — prepare_depara_keys devolve também as chaves ambíguas (conflito na mesma
+    # competência / desempate por valor); enrich_cobranca_with_depara marca com elas
+    # o LANÇAMENTO que casou, não só o total agregado no aviso.
+    depara_norm, chaves_conflito, chaves_valor = t.prepare_depara_keys(df_depara, controls)
+    cob_unmatched, cob_matched = t.enrich_cobranca_with_depara(
+        cobranca_keys, depara_norm, controls, chaves_conflito, chaves_valor)
 
     cob_overridden    = t.apply_manual_group_override(cob_matched, df_grupos, controls)
     cobranca_final    = t.consolidate_cobranca(cob_overridden, controls)
@@ -119,20 +139,18 @@ def run_pipeline(base_reclassificada_override=None, modo_r9_warning: bool = Fals
     consultoria_final      = t.finalize_consultoria(cons)
 
     # -------------------------------------------------------------------
-    # STAGE 6 — ARBITRADO (V2/R9: bloqueio de cruzamento de prefixo;
-    # V2/R10: correção automática por Conta OM antes de bloquear)
+    # STAGE 6 — ARBITRADO (V2/R10: correção automática por Conta OM; V3/R9: o
+    # cruzamento de prefixo residual é MARCADO por lançamento, não removido)
     # -------------------------------------------------------------------
     unm_56, match_56     = t.match_arbitrado(unm_79, normal_cv)
     arbitrado_final_todos = t.finalize_arbitrado(match_56)
     arbitrado_corrigido, corr_arb = t.autocorrigir_conta_om(
         arbitrado_final_todos, df_estrutura, controls)
-    arb_aprovados, bloq_r9_arb = t.split_bloqueio_prefixo(arbitrado_corrigido, controls)
-    arbitrado_final, (arb_bloq_n, arb_bloq_v) = t.aplicar_modo_r9(
-        arb_aprovados, bloq_r9_arb, modo_r9_warning, controls)
+    arbitrado_final, bloq_r9_arb = t.marcar_bloqueio_prefixo(arbitrado_corrigido, controls)
 
     # -------------------------------------------------------------------
-    # STAGE 7 — RECLASSIFICADOR (V2/R9: bloqueio de cruzamento de prefixo;
-    # V2/R10: correção automática por Conta OM antes de bloquear)
+    # STAGE 7 — RECLASSIFICADOR (V2/R10: correção automática por Conta OM;
+    # V3/R9: cruzamento de prefixo residual MARCADO, não removido)
     # -------------------------------------------------------------------
     for_reclass          = t.union_for_reclassificador(unm_56, to_reclass_t117)
     reclassifier_base    = t.build_reclassifier_base(for_reclass)
@@ -147,15 +165,14 @@ def run_pipeline(base_reclassificada_override=None, modo_r9_warning: bool = Fals
     reclassificador_final_todos = t.integrate_reclassified(for_reclass, df_reclass, controls)
     reclassificador_corrigido, corr_recl = t.autocorrigir_conta_om(
         reclassificador_final_todos, df_estrutura, controls)
-    recl_aprovados, bloq_r9_recl = t.split_bloqueio_prefixo(reclassificador_corrigido, controls)
-    reclassificador_final, (recl_bloq_n, recl_bloq_v) = t.aplicar_modo_r9(
-        recl_aprovados, bloq_r9_recl, modo_r9_warning, controls)
+    reclassificador_final, bloq_r9_recl = t.marcar_bloqueio_prefixo(
+        reclassificador_corrigido, controls)
 
     # -------------------------------------------------------------------
-    # STAGE 8 — FINAL UNION + CONSOLIDATE
-    # (V2: censo final R8 + conservação A1 ANTES de gravar qualquer saída)
+    # STAGE 8 — FINAL UNION + RECONCILIAÇÃO DA ESPINHA + CONSOLIDATE
+    # (V3: censo final R8 + conservação por identidade ANTES de gravar saída)
     # -------------------------------------------------------------------
-    unioned    = t.final_union(
+    unioned = t.final_union(
         cobranca_final,
         match_cc_final,
         match_om_final,
@@ -164,42 +181,39 @@ def run_pipeline(base_reclassificada_override=None, modo_r9_warning: bool = Fals
         reclassificador_final,
     )
 
-    # V2/R8 — nenhuma chave pode sair mais duplicada do que entrou (ERRO bloqueante)
+    # V3/R8 — nenhum ID pode sair duplicado (ERRO bloqueante)
     controls.censo_final(unioned)
 
-    # V2/R9 — bloqueados de Arbitrado + Reclassificador, concatenados (pro
-    # relatório, sempre — independente do modo). V2/R10 — o termo de
-    # conservação usa (arb_bloq_n/v + recl_bloq_n/v), que aplicar_modo_r9 já
-    # zera quando modo_r9_warning=True.
     bloqueados_r9 = pd.concat([bloq_r9_arb, bloq_r9_recl], ignore_index=True, sort=False)
     corrigidos_r9 = pd.concat([corr_arb, corr_recl], ignore_index=True, sort=False)
-    controls.registra_termo("bloqueio_prefixo_r9",
-                            arb_bloq_n + recl_bloq_n,
-                            arb_bloq_v + recl_bloq_v)
-
-    # V2/A1 — equação de conservação: base bruta = T63 + T62 + colapso T132 + R9 + union
     controls.registra_termo("union_final", len(unioned),
                             float(unioned["Valor"].sum()) if len(unioned) else 0.0)
-    controls.verifica_conservacao()
 
-    final_consolidated = t.build_final_consolidated(unioned, controls)
-
-    # -------------------------------------------------------------------
-    # RELATÓRIO DE EXCEÇÕES (Tool 200/201) — V2/R6: universo pós-T63 nas 2 abas
-    # -------------------------------------------------------------------
+    # RELATÓRIO DE EXCEÇÕES — roda ANTES da reconciliação porque é quem registra a
+    # razão CC_NAO_CADASTRADO por lançamento (V3)
     exceptions = t.build_exceptions(dropped_contas, df_pos_t63, df_cc_cad,
                                     bloqueados_r9, corrigidos_r9, controls)
+
+    # V3 — a espinha reconciliada É a base final (universo completo, marcado)
+    base_completa = t.reconciliar_espinha(df_base, unioned, controls)
+    controls.verifica_conservacao(df_base, base_completa)
+
+    final_aba1, final_aba2 = t.build_final_consolidated(base_completa, controls)
 
     # -------------------------------------------------------------------
     # VALOR POR PACOTE (antes × depois da cascata de classificação)
     # -------------------------------------------------------------------
-    pacote_report = t.build_pacote_report(unioned, df_estrutura)
+    # V3 — o "antes" do relatório sai de 'Pacote GCUT', que só existe nas linhas que
+    # passaram pelo T62. Nas demais a coluna vem NaN do concat e o
+    # .fillna("(sem pacote)") que build_pacote_report já faz as agrupa num bucket
+    # próprio — comportamento desejado (é o valor que ainda não tem pacote no GCUT).
+    pacote_report = t.build_pacote_report(base_completa, df_estrutura)
 
     # -------------------------------------------------------------------
     # WRITE OUTPUTS
     # -------------------------------------------------------------------
     path_reclass = io.write_reclassifier_base(reclassifier_base)
-    path_final   = io.write_final_consolidated(final_consolidated)
+    path_final   = io.write_final_consolidated(final_aba1, final_aba2)
 
     logger.info("=" * 70)
     logger.info("PIPELINE COMPLETE")
@@ -209,10 +223,15 @@ def run_pipeline(base_reclassificada_override=None, modo_r9_warning: bool = Fals
 
     return {
         "reclassifier_base": reclassifier_base,
-        "final_consolidated": final_consolidated,
+        # V3 — "final_consolidated" continua sendo a base de carga, agora só a ABA 1
+        # (universo gerencial); a aba 2 (Classes de Valor excluídas) sai em
+        # "final_aba2" e o universo completo pré-formatação em "base_completa".
+        "final_consolidated": final_aba1,
+        "final_aba2": final_aba2,
+        "base_completa": base_completa,
         "path_reclass": path_reclass,
         "path_final": path_final,
-        "exceptions": exceptions,   # {"contas": df, "centros_custo": df}
+        "exceptions": exceptions,   # {"contas": df, "centros_custo": df, "bloqueio_prefixo": df, "correcao_automatica": df}
         "pacote_report": pacote_report,
         "controls": controls,       # V2 — avisos estruturados + termos de conservação
         # Intermediates for debugging
@@ -225,6 +244,7 @@ def run_pipeline(base_reclassificada_override=None, modo_r9_warning: bool = Fals
             "arbitrado_final": arbitrado_final,
             "reclassificador_final": reclassificador_final,
             "unioned": unioned,
+            "base_completa": base_completa,
             "bloqueados_r9": bloqueados_r9,
             "corrigidos_r9": corrigidos_r9,
         },
