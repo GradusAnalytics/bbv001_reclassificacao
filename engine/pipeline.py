@@ -64,11 +64,16 @@ def run_pipeline(base_reclassificada_override=None) -> dict:
     # -------------------------------------------------------------------
     df_base       = io.read_base_fechamento()        # Tool 4  + 87
     df_depara     = io.read_depara_custo()           # Tool 10
+    # V4 (dono, 2026-08-04) — confere as 5 abas de cadastros_auxiliares ANTES de
+    # qualquer leitura de cadastro: aborta com BloqueioError ABA_AUXILIAR_FALTANDO
+    # se faltar alguma, em vez de cada read_* abaixo falhar depois com um erro cru
+    # de "sheet não existe" (sem o fallback de posição que a v3 tinha).
+    io.valida_cadastros_auxiliares()
     df_class      = io.read_classe_valor_conta()     # Tool 47
     df_unico_cv   = io.read_unico_cv()               # Tool 48
     df_estrutura  = io.read_estrutura_contas()       # Tool 61
     df_grupos     = io.read_depara_grupos()          # V2/R4 (obrigatório; era Tool 86 hardcoded)
-    df_cc_cad     = io.read_estrutura_entidades_cc() # Tool 200 (cadastro de CC, opcional)
+    df_cc_cad     = io.read_estrutura_entidades_cc() # Tool 200 (cadastro de CC, agora obrigatório)
 
     # V2/D3 — base vazia é erro acionável, não crash críptico lá na frente
     if len(df_base) == 0:

@@ -30,49 +30,51 @@ RECLASSIFIER_BRIDGE_TIMEOUT_S = int(os.environ.get("RECLASSIFIER_BRIDGE_TIMEOUT_
 # --- Inputs (mapped to Alteryx Tool IDs) ---------------------------------
 INPUT_FILES = {
     "base_fechamento": {                   # Tool 4
-        # Filename/sheet overridable so the same pipeline can run any monthly cycle
+        # Filename overridable so the same pipeline can run any monthly cycle
         # (e.g. BBV001_BASE_FILE="1. Base Fechamento Mar26.xlsx"). Default = Abr26.
+        # V4 (dono, 2026-08-04) — lê a 1ª aba do arquivo (índice 0), sem checar nome
+        # (antes exigia a aba 'Base' exata). Ver io_utils._read_excel_primeira_aba.
+        # Não há mais chave 'sheet' aqui.
         "path": INPUT_DIR / os.environ.get("BBV001_BASE_FILE", "Base Fechamento Abr26.xlsx"),
-        "sheet": os.environ.get("BBV001_BASE_SHEET", "Base"),
     },
     "depara_custo": {                       # Tool 10
+        # V4 (dono, 2026-08-04) — idem base_fechamento: 1ª aba, sem nome fixo (antes
+        # exigia 'Planilha1' exata).
         "path": INPUT_DIR / "DeXPara_Custo_Gradus.xlsx",
-        "sheet": "Planilha1",
     },
-    "classe_valor_conta": {                 # Tool 47 & 48 (same file, different sheets)
-        "path": INPUT_DIR / "BBV001-260509-Classe de Valor x Conta Contábil-v1 MU.xlsx",
-        "sheet_base": "Base",               # Tool 47
-        "sheet_unico_cv": "Unico CV",       # Tool 48
-    },
-    "estrutura_contas": {                   # Tool 61
-        "path": INPUT_DIR / "20260509 - 12h30 - Estrutura de contas.xlsx",
-        "sheet": "Estrutura de contas",
+    "cadastros_auxiliares": {               # Tools 47, 48, 61, 200, 86/88
+        # V4 (dono, 2026-08-04) — substitui os 4 campos de cadastro que existiam
+        # separados (classe_valor_conta, estrutura_contas, estrutura_entidades_cc,
+        # depara_grupos). 1 arquivo, 5 abas OBRIGATÓRIAS, lidas por NOME — sem
+        # fallback de posição (io_utils.valida_cadastros_auxiliares aborta com
+        # BloqueioError ABA_AUXILIAR_FALTANDO se faltar qualquer uma). O fallback
+        # "cai na 1ª aba" que depara_grupos/estrutura_entidades_cc tinham como
+        # arquivos avulsos (v3.1/v3.3) foi removido: dentro de 1 arquivo com 5
+        # abas, cair na 1ª aba por nome não encontrado leria dados de OUTRO
+        # cadastro em silêncio.
+        #
+        # Renomes de aba vs a v3 (pedido do time de analytics + achado de sessão):
+        #   'Base'     -> 'Allowlist'  (Tool 47) — a aba é uma allowlist de pares
+        #                 [Classe de Valor, Conta Contábil] válidos, não uma "base".
+        #   'Unico CV' -> 'Arbitragem' (Tool 48) — nome que o próprio arquivo do
+        #                 cliente já usa no banner interno da aba, e que bate com o
+        #                 Tipo "Arbitrado classe" que a ferramenta produz.
+        #
+        # O cadastro de Centro de Custo (Estrutura completa de Entidades) deixa de
+        # ser opcional — agora é 1 das 5 abas obrigatórias, igual às outras.
+        "path": INPUT_DIR / "cadastros_auxiliares.xlsx",
+        "sheet_allowlist":    "Allowlist",
+        "sheet_arbitragem":   "Arbitragem",
+        "sheet_estrutura":    "Estrutura de contas",
+        "sheet_entidades_cc": "Estrutura completa de Entidades",
+        # BBV001_DEPARA_GRUPOS_SHEET preservado como override explícito de teste —
+        # não é fallback silencioso (que foi removido): é o dev escolhendo outro
+        # nome de propósito, não a ferramenta adivinhando.
+        "sheet_grupos":       os.environ.get("BBV001_DEPARA_GRUPOS_SHEET", "Grupos Cobrança"),
     },
     "base_reclassificada": {                # Tool 124 (optional — only on 2nd run)
         "path": INPUT_DIR / "base_reclassificada_a2f37.xlsx",
         "sheet": "Sheet1",
-    },
-    "estrutura_entidades_cc": {             # NOVO — cadastro de Centros de Custo (Tool 200)
-        # Cadastro de Entidades x Centros de Custo. Enviar em .xlsx (pyxlsb não lê
-        # este arquivo de forma confiável). Opcional: sem ele, a aba de CC sai vazia.
-        "path": INPUT_DIR / "estrutura_entidades_cc.xlsx",
-        "sheet": "Estrutura completa de Entidades",
-    },
-    "depara_grupos": {                      # V2/R4 — de-para GRUPO → Conta (OBRIGATÓRIO)
-        # Substitui os 11 overrides hardcoded do Tool 86 (MANUAL_GROUP_OVERRIDES,
-        # mantidos abaixo apenas como seed do template). Manutenção do de-para vira
-        # upload de cadastro, não deploy de código. 1 aba, header na linha 1.
-        "path": INPUT_DIR / "depara_grupos.xlsx",
-        # V3.1 (2026-07-29) — lê por NOME, com fallback para a 1ª aba. Ler por posição
-        # impedia o layout de um arquivo único com todos os cadastros em abas (a
-        # posição 0 seria a aba de outro input). O fallback preserva os arquivos de
-        # depara_grupos já em uso, cuja aba pode ter qualquer nome.
-        # V3.3 (dono, 2026-08-03) — a aba passou a se chamar 'Grupos Cobrança'. É o nome
-        # que o arquivo mestre de cadastros já usa. O fallback para a 1ª aba continua,
-        # então arquivo legado (aba 'Sheet1', que é o caso de TODAS as rodadas até 08-03)
-        # segue rodando.
-        "sheet": os.environ.get("BBV001_DEPARA_GRUPOS_SHEET", "Grupos Cobrança"),
-        "sheet_fallback": 0,
     },
 }
 

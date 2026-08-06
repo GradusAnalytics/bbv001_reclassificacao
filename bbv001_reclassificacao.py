@@ -7,10 +7,14 @@ Contrato gradus-platform (ver dummy_repo):
   - Retorna um dict {código_output: valor}. Para arquivos, o valor é um BytesIO
     e o nome vai em "<código>__nome". O wrapper sobe os arquivos ao S3 e faz o callback.
 
-Inputs  (InputField.code): base_fechamento, depara_custo, classe_valor_conta,
-                           estrutura_contas, depara_grupos (V2/R4 — OBRIGATÓRIO, de-para
-                           GRUPO→Conta que substitui os 11 overrides hardcoded),
-                           estrutura_entidades_cc (opcional).
+Inputs  (InputField.code): base_fechamento, depara_custo (cada um lê a 1ª aba do
+                           arquivo, sem checar nome — V4, dono 2026-08-04),
+                           cadastros_auxiliares (V4 — OBRIGATÓRIO; substitui os 4
+                           campos que existiam separados: 1 arquivo com 5 abas
+                           nomeadas — Allowlist, Arbitragem, Estrutura de contas,
+                           Estrutura completa de Entidades, Grupos Cobrança —
+                           todas obrigatórias, sem fallback de posição; falta de
+                           qualquer uma aborta com ABA_AUXILIAR_FALTANDO).
                            A etapa de reclassificação chama, via engine.reclassifier_bridge,
                            a ferramenta reclassificador_predicao_bbv001 (API do PPR), que já
                            usa seus próprios arquivos default de modelo/parâmetros — não são
@@ -54,20 +58,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "eng
 CANON = {
     "base_fechamento":      "base_fechamento.xlsx",
     "depara_custo":         "DeXPara_Custo_Gradus.xlsx",
-    "classe_valor_conta":   "BBV001-260509-Classe de Valor x Conta Contábil-v1 MU.xlsx",
-    "estrutura_contas":      "20260509 - 12h30 - Estrutura de contas.xlsx",
-    "depara_grupos":         "depara_grupos.xlsx",          # V2/R4 — obrigatório
-    "estrutura_entidades_cc": "estrutura_entidades_cc.xlsx",
+    # V4 (dono, 2026-08-04) — substitui classe_valor_conta, estrutura_contas,
+    # depara_grupos e estrutura_entidades_cc: 1 arquivo, 5 abas nomeadas.
+    "cadastros_auxiliares": "cadastros_auxiliares.xlsx",
 }
 
 # V2/D1 — inputs obrigatórios (validação upfront ANTES de rodar o engine) + nome
 # amigável para a mensagem de erro que o usuário do PPR vai ler.
 REQUIRED_INPUTS = {
-    "base_fechamento":    "Base de Fechamento (mensal)",
-    "depara_custo":       "De-Para Custo (Cobrança)",
-    "classe_valor_conta": "Classe de Valor × Conta Contábil",
-    "estrutura_contas":   "Estrutura de Contas",
-    "depara_grupos":      "De-Para de Grupos → Conta (novo na v2)",
+    "base_fechamento":      "Base de Fechamento (mensal)",
+    "depara_custo":         "De-Para Custo (Cobrança)",
+    # V4 — o cadastro de Centro de Custo, opcional até a v3.3, passa a ser
+    # obrigatório dentro deste arquivo único (decisão do dono).
+    "cadastros_auxiliares": ("Cadastros Auxiliares — Allowlist, Arbitragem, "
+                             "Estrutura de Contas, Estrutura completa de "
+                             "Entidades, Grupos Cobrança (1 arquivo, 5 abas)"),
 }
 WORK = "/tmp/bbv001"
 IN_DIR = os.path.join(WORK, "inputs")
@@ -237,9 +242,8 @@ def _monta_auditoria(base_completa):
     return por_tipo, por_status
 
 
-def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
-         estrutura_contas=None, base_reclassificada=None, estrutura_entidades_cc=None,
-         depara_grupos=None):
+def main(base_fechamento=None, depara_custo=None, cadastros_auxiliares=None,
+         base_reclassificada=None):
     import pandas as pd
 
     # 1) Diretórios limpos por execução
@@ -247,13 +251,12 @@ def main(base_fechamento=None, depara_custo=None, classe_valor_conta=None,
     os.makedirs(IN_DIR, exist_ok=True)
     os.makedirs(OUT_DIR, exist_ok=True)
 
+    # V4 (dono, 2026-08-04) — 3 arquivos em vez de 6: cadastros_auxiliares
+    # substitui classe_valor_conta/estrutura_contas/depara_grupos/estrutura_entidades_cc.
     incoming = {
         "base_fechamento":      base_fechamento,
         "depara_custo":         depara_custo,
-        "classe_valor_conta":   classe_valor_conta,
-        "estrutura_contas":     estrutura_contas,
-        "depara_grupos":        depara_grupos,          # V2/R4
-        "estrutura_entidades_cc": estrutura_entidades_cc,
+        "cadastros_auxiliares": cadastros_auxiliares,
     }
     gravados = {}
     for role, fobj in incoming.items():

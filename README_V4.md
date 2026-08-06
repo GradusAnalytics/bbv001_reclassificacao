@@ -15,6 +15,19 @@
 > com os cadastros em arquivos separados. O texto abaixo ainda descreve a v3
 > (paridade Alteryx, cascata, schema) — vale integralmente para a v4, que só muda o
 > contrato de input, não a lógica.
+>
+> ✅ **Atualização 2026-08-04 — contrato de input consolidado.** Os 4 campos de
+> cadastro (`classe_valor_conta`, `estrutura_contas`, `estrutura_entidades_cc`,
+> `depara_grupos`) foram substituídos por **1 campo `cadastros_auxiliares`**: um
+> arquivo com 5 abas obrigatórias, lidas por nome, sem fallback de posição —
+> `Allowlist` (era `Base`) · `Arbitragem` (era `Unico CV`) · `Estrutura de
+> contas` · `Estrutura completa de Entidades` · `Grupos Cobrança`. O cadastro de
+> Centro de Custo deixou de ser opcional. `base_fechamento` e `depara_custo`
+> passam a ler a 1ª aba do arquivo, sem checar nome. `main()` cai de 7 para 4
+> parâmetros. Nenhuma coluna do schema de SAÍDA muda; nenhuma stage da cascata
+> muda. Prova de zero-diff (mesmos dados, contrato novo, lançamento a
+> lançamento contra a rodada anterior): `docs/FONTE_DA_VERDADE.md §3.6`. Spec:
+> `docs/superpowers/specs/2026-08-04-cadastros-auxiliares-consolidados-design.md`.
 
 # BBV001 v3 — O que mudou vs a v1 e a v2 (e o que cadastrar no PPR)
 

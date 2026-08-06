@@ -130,13 +130,66 @@ def _aplica_aliases(df: pd.DataFrame, input_key: str) -> pd.DataFrame:
     return df
 
 
+def _read_excel_primeira_aba(path):
+    """
+    V4 (dono, 2026-08-04) — lê a 1ª aba do arquivo (índice 0), sem checar nome.
+    Usado por base_fechamento e De-Para de Custo: os dois deixaram de exigir nome
+    de aba fixo ('Base'/'Planilha1' exatos, respectivamente).
+
+    Devolve (df, nome_da_aba) — o NOME resolvido, não o índice, para que mensagens
+    de erro downstream (_valida_colunas) citem a aba de verdade se as colunas
+    obrigatórias faltarem.
+    """
+    df = _read_excel(path, sheet_name=0)
+    nome = pd.ExcelFile(path).sheet_names[0]
+    return df, nome
+
+
+def valida_cadastros_auxiliares() -> None:
+    """
+    V4 (dono, 2026-08-04) — confere, ANTES de qualquer leitura de cadastro, que as 5
+    abas obrigatórias existem no arquivo `cadastros_auxiliares`. Substitui o
+    fallback "cai na 1ª aba" que `depara_grupos`/`estrutura_entidades_cc` tinham
+    como arquivos avulsos (v3.1/v3.3): dentro de 1 arquivo com 5 abas, cair na 1ª
+    aba por nome não encontrado leria dados de OUTRO cadastro em silêncio — pior
+    que abortar com erro acionável.
+
+    nrows=0 mantém a checagem barata (só estrutura, sem ler nenhuma linha de dado)
+    e reaproveita a detecção de .xlsb / erro de abertura já centralizada em
+    _read_excel.
+    """
+    cfg = INPUT_FILES["cadastros_auxiliares"]
+    path: Path = cfg["path"]
+    if not path.exists():
+        raise BloqueioError(
+            "INPUT_OBRIGATORIO_AUSENTE",
+            "O input 'cadastros_auxiliares' (Allowlist · Arbitragem · Estrutura de "
+            "Contas · Estrutura completa de Entidades · Grupos Cobrança, num "
+            "arquivo só) é obrigatório e não foi enviado. Envie o arquivo e "
+            "execute novamente.")
+    todas_as_abas = _read_excel(path, sheet_name=None, nrows=0)
+    esperadas = {k: v for k, v in cfg.items() if k.startswith("sheet_")}
+    faltando = [nome for nome in esperadas.values() if nome not in todas_as_abas]
+    if faltando:
+        raise BloqueioError(
+            "ABA_AUXILIAR_FALTANDO",
+            f"O arquivo 'cadastros_auxiliares' ('{path.name}') não tem a(s) aba(s) "
+            f"obrigatória(s): {faltando}. Abas encontradas: "
+            f"{sorted(todas_as_abas)}. As 5 abas esperadas são: "
+            f"{sorted(esperadas.values())}.")
+
+
 # -------------------------------------------------------------------------
 # Inputs
 # -------------------------------------------------------------------------
 def read_base_fechamento() -> pd.DataFrame:
-    """Tool 4 + Tool 87 (rename Valor do Lancamento → Valor)."""
+    """Tool 4 + Tool 87 (rename Valor do Lancamento → Valor).
+
+    V4 (dono, 2026-08-04) — lê a 1ª aba do arquivo, sem checar nome (antes exigia
+    a aba 'Base' exata).
+    """
     cfg = INPUT_FILES["base_fechamento"]
-    df = _read_excel(cfg["path"], sheet_name=cfg["sheet"])
+    df, aba = _read_excel_primeira_aba(cfg["path"])
     df = df.rename(columns={"Valor do Lancamento": "Valor"})
     # V2/D1 — validar ANTES de tocar qualquer coluna. A ordem importa: a coerção de
     # 'Conta Contabil' logo abaixo indexa a coluna pelo nome, então se o usuário
@@ -147,7 +200,7 @@ def read_base_fechamento() -> pd.DataFrame:
     # (Task 13, achado A1/A2). Vem depois do rename porque REQUIRED_COLUMNS exige
     # 'Valor', o nome já renomeado. Regressão coberta por
     # tests/test_v3_colunas_faltando_antes_da_coercao.py.
-    _valida_colunas(df, "base_fechamento", cfg["path"], cfg["sheet"])
+    _valida_colunas(df, "base_fechamento", cfg["path"], aba)
     # V3 — ID Lançamento: posição da linha na base bruta (1..N), imutável.
     # É a ÚNICA chave verdadeira por lançamento: "Codigo Interno" não serve porque
     # duplicata nativa existe e é válida (dono, 2026-07-08; MAPA_PROCESSO G9).
@@ -182,102 +235,87 @@ def read_base_fechamento() -> pd.DataFrame:
 
 
 def read_depara_custo() -> pd.DataFrame:
-    """Tool 10. V2/R3: DATA_BASE agora é coluna obrigatória (resolução por recência)."""
+    """Tool 10. V2/R3: DATA_BASE agora é coluna obrigatória (resolução por recência).
+
+    V4 (dono, 2026-08-04) — lê a 1ª aba do arquivo, sem checar nome (antes exigia
+    a aba 'Planilha1' exata).
+    """
     cfg = INPUT_FILES["depara_custo"]
-    df = _read_excel(cfg["path"], sheet_name=cfg["sheet"])
-    _valida_colunas(df, "depara_custo", cfg["path"], cfg["sheet"])  # V2/D1
+    df, aba = _read_excel_primeira_aba(cfg["path"])
+    _valida_colunas(df, "depara_custo", cfg["path"], aba)
     log_step(logger, "10", "Read De-Para Custo", df)
     return df
 
 
 def read_classe_valor_conta() -> pd.DataFrame:
-    """Tool 47 — sheet 'Base' (real header below a few title rows).
+    """Tool 47 — sheet 'Allowlist' (era 'Base'; renomeada na v4, dono 2026-08-04 —
+    a aba é uma allowlist de pares [Classe de Valor, Conta Contábil] válidos, não
+    uma "base"), header abaixo de linhas de banner.
 
-    V3.3 — marker por lista e aliases de coluna: a aba `Base` do arquivo mestre de
-    cadastros usa 'Nome da classe de valor' / 'Cód conta contábil permitida' /
-    'Cód Classe de Valor' onde o arquivo anterior usava 'Nome classe de valor' /
-    'Cód conta contábil' / 'Número att'. Os dois arquivos são legíveis.
+    V3.3 — marker por lista e aliases de coluna: o arquivo mestre de cadastros usa
+    'Nome da classe de valor' / 'Cód conta contábil permitida' / 'Cód Classe de
+    Valor' onde o layout antigo usava 'Nome classe de valor' / 'Cód conta
+    contábil' / 'Número att'. Os dois são legíveis.
+
+    V4 — path e nome de aba vêm de INPUT_FILES['cadastros_auxiliares'] (antes,
+    INPUT_FILES['classe_valor_conta']['sheet_base'], arquivo próprio).
     """
-    cfg = INPUT_FILES["classe_valor_conta"]
+    cfg = INPUT_FILES["cadastros_auxiliares"]
     df = _read_excel_with_header_marker(
-        cfg["path"], cfg["sheet_base"], HEADER_MARKERS["classe_valor_conta_base"])
+        cfg["path"], cfg["sheet_allowlist"], HEADER_MARKERS["classe_valor_conta_base"])
     df = _aplica_aliases(df, "classe_valor_conta_base")            # V3.3 — antes da validação
-    _valida_colunas(df, "classe_valor_conta_base", cfg["path"], cfg["sheet_base"])  # V2/D1
-    log_step(logger, "47", "Read Classe Valor x Conta (Base)", df)
+    _valida_colunas(df, "classe_valor_conta_base", cfg["path"], cfg["sheet_allowlist"])
+    log_step(logger, "47", "Read Allowlist (Classe Valor x Conta)", df)
     return df
 
 
 def read_unico_cv() -> pd.DataFrame:
-    """Tool 48 — sheet 'Unico CV' (real header below a few title rows)."""
-    cfg = INPUT_FILES["classe_valor_conta"]
+    """Tool 48 — sheet 'Arbitragem' (era 'Unico CV'; renomeada na v4, dono
+    2026-08-04 — nome que o próprio arquivo do cliente já usa no banner interno
+    da aba, e que bate com o Tipo 'Arbitrado classe' que a ferramenta produz),
+    header abaixo de linhas de banner.
+
+    V4 — path e nome de aba vêm de INPUT_FILES['cadastros_auxiliares'].
+    """
+    cfg = INPUT_FILES["cadastros_auxiliares"]
     df = _read_excel_with_header_marker(
-        cfg["path"], cfg["sheet_unico_cv"], HEADER_MARKERS["classe_valor_conta_unico_cv"])
-    _valida_colunas(df, "classe_valor_conta_unico_cv", cfg["path"], cfg["sheet_unico_cv"])  # V2/D1
-    log_step(logger, "48", "Read Unico CV", df)
+        cfg["path"], cfg["sheet_arbitragem"], HEADER_MARKERS["classe_valor_conta_unico_cv"])
+    _valida_colunas(df, "classe_valor_conta_unico_cv", cfg["path"], cfg["sheet_arbitragem"])
+    log_step(logger, "48", "Read Arbitragem (Unico CV)", df)
     return df
 
 
 def read_estrutura_contas() -> pd.DataFrame:
-    """Tool 61."""
-    cfg = INPUT_FILES["estrutura_contas"]
-    df = _read_excel(cfg["path"], sheet_name=cfg["sheet"])
-    _valida_colunas(df, "estrutura_contas", cfg["path"], cfg["sheet"])  # V2/D1
+    """Tool 61. V4 (dono, 2026-08-04) — path e nome de aba vêm de
+    INPUT_FILES['cadastros_auxiliares'] (era arquivo próprio)."""
+    cfg = INPUT_FILES["cadastros_auxiliares"]
+    df = _read_excel(cfg["path"], sheet_name=cfg["sheet_estrutura"])
+    _valida_colunas(df, "estrutura_contas", cfg["path"], cfg["sheet_estrutura"])
     log_step(logger, "61", "Read Estrutura de Contas", df)
     return df
 
 
 def read_depara_grupos() -> pd.DataFrame:
-    """V2/R4 (NOVO) — de-para GRUPO → Conta OM / Conta Contábil. Input OBRIGATÓRIO;
+    """V2/R4 — de-para GRUPO → Conta OM / Conta Contábil. Input OBRIGATÓRIO;
     substitui os 11 overrides hardcoded do Tool 86. Template: header na linha 1,
     colunas Grupo · Conta OM · Conta Contábil (seed em
     aux_files/gera_seed_depara_grupos.py).
 
-    V3.1 (2026-07-30): a aba é lida por NOME (`INPUT_FILES[...]["sheet"]`, default
-    `Grupos Cobrança`), com fallback para a primeira aba do arquivo. Deixou de ser
-    "1 aba": o arquivo pode trazer todos os cadastros, um por aba, e o mesmo arquivo
-    ser enviado em todos os campos — só a Base de Fechamento continua separada
-    (ela e a aba `Base` do classe_valor_conta exigiriam o mesmo nome de aba)."""
-    cfg = INPUT_FILES["depara_grupos"]
-    path: Path = cfg["path"]
-    if not path.exists():
-        raise BloqueioError(
-            "INPUT_OBRIGATORIO_AUSENTE",
-            "O input 'depara_grupos' (De-Para de Grupos de Cobrança → Conta) é obrigatório "
-            "e não foi enviado. Use o template de 3 colunas (Grupo · Conta OM · Conta "
-            "Contábil) — sem ele não é possível classificar o caminho Cobrança.")
-    # V3.1 — aba por nome, caindo para a 1ª aba quando o nome não existe no arquivo
-    aba_esperada = cfg["sheet"]
-    aba = aba_esperada
-    fallback_usado = False
-    try:
-        df = _read_excel(path, sheet_name=aba)
-    except ValueError:
-        fallback_usado = True
-        aba = cfg.get("sheet_fallback", 0)
-        df = _read_excel(path, sheet_name=aba)
-        logger.info(
-            f"[R4] Aba {aba_esperada!r} não existe em '{path.name}' — lendo a primeira "
-            f"aba do arquivo. Nomear a aba permite enviar todos os cadastros num "
-            f"arquivo só.")
-    # V3.1 (revisão final) — se a validação de colunas falhar DEPOIS do fallback, o
-    # `logger.info` acima nunca chega ao usuário: um BloqueioError aborta o main()
-    # antes de montar o log de execução (`bbv001_reclassificacao.py`). Por isso o
-    # rótulo de aba passado à validação, sozinho, tem de dizer que houve fallback,
-    # qual era a aba esperada e que ela não foi encontrada — sem isso a mensagem
-    # citava só a aba efetivamente lida ("aba '0'"), que não diz nada ao usuário.
-    aba_label = aba
-    if fallback_usado:
-        aba_label = (
-            f"{aba} (a ferramenta tentou a 1ª aba do arquivo porque a aba esperada "
-            f"{aba_esperada!r} não foi encontrada)"
-        )
-    _valida_colunas(df, "depara_grupos", path, aba_label)  # V2/D1
+    V4 (dono, 2026-08-04) — path e nome de aba ('Grupos Cobrança') vêm de
+    INPUT_FILES['cadastros_auxiliares']. O fallback "cai na 1ª aba" da v3.1/v3.3
+    foi REMOVIDO (ver valida_cadastros_auxiliares, chamada antes desta função no
+    pipeline) — dentro de 1 arquivo com 5 abas nomeadas, cair na 1ª aba leria
+    dados de outro cadastro em silêncio.
+    """
+    cfg = INPUT_FILES["cadastros_auxiliares"]
+    df = _read_excel(cfg["path"], sheet_name=cfg["sheet_grupos"])
+    _valida_colunas(df, "depara_grupos", cfg["path"], cfg["sheet_grupos"])
     # Cadastro mantido pelo usuário: strip nas 3 colunas de texto (contrato do
     # template — evita não-match por espaço acidental; não afeta a paridade dos
     # joins portados do Alteryx, que seguem byte-a-byte).
     for col in ("Grupo", "Conta OM", "Conta Contábil"):
         df[col] = df[col].apply(lambda v: v.strip() if isinstance(v, str) else v)
-    log_step(logger, "R4", "Read De-Para Grupos (novo input obrigatório)", df)
+    log_step(logger, "R4", "Read De-Para Grupos", df)
     return df
 
 
@@ -303,54 +341,50 @@ def read_base_reclassificada() -> Optional[pd.DataFrame]:
 
 def read_estrutura_entidades_cc() -> Optional[pd.DataFrame]:
     """
-    NOVO (Tool 200) — cadastro de Entidades x Centros de Custo.
+    Tool 200 — cadastro de Entidades x Centros de Custo.
 
-    Input OPCIONAL e tolerante a falhas: qualquer problema de leitura apenas emite
-    WARNING e retorna None (a aba 'Centros de Custo' do relatório fica vazia) — nunca
-    derruba a execução, pois as demais saídas não dependem deste cadastro.
+    V4 (dono, 2026-08-04) — deixou de ser input opcional avulso: agora é 1 das 5
+    abas obrigatórias de 'cadastros_auxiliares' (valida_cadastros_auxiliares
+    garante que a aba EXISTE antes desta função rodar no pipeline real). O
+    fallback "cai na 1ª aba" da v3 foi REMOVIDO — dentro de 1 arquivo com 5 abas,
+    cair na 1ª leria dados de outro cadastro em silêncio.
 
-    .xlsx real: lido via openpyxl com data_only=True (pega o valor já calculado das
-    fórmulas). .xlsb (detectado pelos magic bytes, não pela extensão): lido via
-    pyxlsb — atenção que pyxlsb NÃO recalcula fórmulas, só devolve o valor bruto
-    armazenado no arquivo; se o cadastro usar fórmulas, confira se os valores saíram
-    corretos (emite um WARNING adicional nesse caso).
+    Ainda devolve None (não levanta erro) só para "aba presente mas VAZIA" — é a
+    diferença entre "faltou a aba" (ABA_AUXILIAR_FALTANDO, ERRO, bloqueante — já
+    não chega aqui) e "a aba está lá mas sem conteúdo" (WARNING,
+    CADASTRO_CC_NAO_VERIFICADO em transforms.build_exceptions, execução
+    continua). Falha de LEITURA genuína (arquivo corrompido) propaga como
+    exceção crua do pandas/openpyxl — mesma limitação conhecida e aceita, não
+    corrigida de propósito, que já vale para os outros inputs obrigatórios
+    (GUIA_INPUTS_TROUBLESHOOTING.md §3); não ficaria consistente blindar só este
+    input agora que ele também é obrigatório.
+
+    .xlsx: lido via openpyxl com data_only=True (pega o valor já calculado das
+    fórmulas — pd.read_excel não garante isso).
     """
-    cfg = INPUT_FILES["estrutura_entidades_cc"]
+    cfg = INPUT_FILES["cadastros_auxiliares"]
     path: Path = cfg["path"]
-    if not path.exists():
+    sheet = cfg["sheet_entidades_cc"]
+    if _detecta_xlsb(path):
+        # Não deveria acontecer aqui (cadastros_auxiliares é sempre .xlsx no
+        # contrato v4), mas mantém a defesa por consistência com o resto do módulo.
+        raise BloqueioError(
+            "FORMATO_XLSB",
+            f"O arquivo '{path.name}' está em formato .xlsb, que não pode ser "
+            f"lido de forma confiável fora da plataforma. Abra no Excel e salve "
+            f"como .xlsx.")
+    from openpyxl import load_workbook
+    wb = load_workbook(path, read_only=True, data_only=True)
+    rows = list(wb[sheet].values)
+    wb.close()
+    if not rows:
         logger.warning(
-            f"[Tool 200] cadastro de Centros de Custo não encontrado em {path}. "
-            f"A aba 'Centros de Custo' do relatório ficará vazia."
+            f"[Tool 200] aba '{sheet}' de '{path.name}' está vazia. "
+            f"A aba 'Centros de Custo' do relatório de exceções ficará vazia."
         )
         return None
-    try:
-        if _detecta_xlsb(path):
-            # V2/§3.10: sem leitor confiável de .xlsb fora da plataforma (pyxlsb
-            # devolve só a 1ª coluna em silêncio). Input é OPCIONAL → warning e aba
-            # vazia, em vez de derrubar a execução.
-            logger.warning(
-                "[Tool 200] cadastro de CC recebido em .xlsb — formato não pode ser lido "
-                "de forma confiável; salve como .xlsx e reenvie. A aba 'Centros de Custo' "
-                "do relatório de exceções ficará vazia nesta execução."
-            )
-            return None
-        else:
-            from openpyxl import load_workbook
-            wb = load_workbook(path, read_only=True, data_only=True)
-            sheet = cfg["sheet"] if cfg["sheet"] in wb.sheetnames else wb.sheetnames[0]
-            rows = list(wb[sheet].values)
-            wb.close()
-            if not rows:
-                logger.warning("[Tool 200] cadastro de CC vazio. Aba 'Centros de Custo' ficará vazia.")
-                return None
-            header = [str(h) if h is not None else f"col{i}" for i, h in enumerate(rows[0])]
-            df = pd.DataFrame(rows[1:], columns=header)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            f"[Tool 200] não foi possível ler o cadastro de CC ({exc}). "
-            f"A aba 'Centros de Custo' ficará vazia."
-        )
-        return None
+    header = [str(h) if h is not None else f"col{i}" for i, h in enumerate(rows[0])]
+    df = pd.DataFrame(rows[1:], columns=header)
     log_step(logger, "200", "Read Estrutura de Entidades x CC", df)
     return df
 
